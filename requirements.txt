@@ -1,0 +1,27 @@
+# Data collection and processing
+nfl-data-py
+pandas
+numpy
+requests
+beautifulsoup4
+sqlite3
+
+# Database
+sqlalchemy
+psycopg2-binary
+
+# Web scraping (backup)
+selenium
+webdriver-manager
+
+# Data analysis
+scipy
+scikit-learn
+
+# Configuration
+python-dotenv
+pyyaml
+
+# Utilities
+tqdm
+dateutil
