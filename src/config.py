@@ -28,8 +28,14 @@ class DataCollectionConfig:
 @dataclass
 class Config:
     """Main configuration class."""
-    database: DatabaseConfig = DatabaseConfig()
-    data_collection: DataCollectionConfig = DataCollectionConfig()
+    database: DatabaseConfig = None
+    data_collection: DataCollectionConfig = None
+    
+    def __post_init__(self):
+        if self.database is None:
+            self.database = DatabaseConfig()
+        if self.data_collection is None:
+            self.data_collection = DataCollectionConfig()
     
     @classmethod
     def from_env(cls) -> "Config":

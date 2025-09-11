@@ -2,13 +2,24 @@
 
 import logging
 import time
+import ssl
+import certifi
 from typing import List, Dict, Optional
 import pandas as pd
 import nfl_data_py as nfl
 from tqdm import tqdm
 
-from ..database import DatabaseManager
-from ..config import Config
+# Configure SSL context to use system certificates
+ssl_context = ssl.create_default_context()
+ssl_context.check_hostname = False
+ssl_context.verify_mode = ssl.CERT_NONE
+
+try:
+    from ..database import DatabaseManager
+    from ..config import Config
+except ImportError:
+    from database import DatabaseManager
+    from config import Config
 
 logger = logging.getLogger(__name__)
 
@@ -106,7 +117,7 @@ class NFLDataCollector:
             for season in tqdm(seasons, desc="Collecting player rosters"):
                 try:
                     # Get roster data for the season
-                    rosters = nfl.import_rosters([season])
+                    rosters = nfl.import_seasonal_rosters([season])
                     
                     if rosters.empty:
                         logger.warning(f"No roster data found for season {season}")
@@ -184,29 +195,40 @@ class NFLDataCollector:
     def _collect_season_games_and_stats(self, season: int):
         """Collect games and stats for a specific season."""
         
-        # Get weekly player stats (this includes game information)
+        # Get weekly player stats 
         weekly_stats = nfl.import_weekly_data([season])
         
         if weekly_stats.empty:
             logger.warning(f"No weekly stats found for season {season}")
             return
         
-        # Process games first
+        # Create game IDs and collect unique games
+        weekly_stats['game_id'] = (
+            weekly_stats['season'].astype(str) + '_' +
+            weekly_stats['week'].astype(str) + '_' +
+            weekly_stats['recent_team'] + '_vs_' +
+            weekly_stats['opponent_team']
+        )
+        
+        # Process games first - get unique games
+        games_info = weekly_stats[['season', 'week', 'recent_team', 'opponent_team', 'game_id']].drop_duplicates()
+        
         games_data = []
         seen_games = set()
         
-        for _, row in weekly_stats.iterrows():
-            game_id = row.get('game_id', '')
-            if game_id and game_id not in seen_games:
+        for _, row in games_info.iterrows():
+            game_id = row['game_id']
+            if game_id not in seen_games:
+                # We don't know which team is home/away from weekly data, so we'll set both to None
                 game_data = {
                     'game_id': game_id,
                     'season_id': season,
-                    'week': row.get('week', 0),
-                    'game_date': row.get('game_date'),
-                    'home_team_id': row.get('home_team'),
-                    'away_team_id': row.get('away_team'),
-                    'home_score': None,  # Not available in weekly stats
-                    'away_score': None,  # Not available in weekly stats
+                    'week': row['week'],
+                    'game_date': None,  # Not available in weekly stats
+                    'home_team_id': None,  # Can't determine from weekly stats
+                    'away_team_id': None,  # Can't determine from weekly stats
+                    'home_score': None,
+                    'away_score': None,
                     'weather_conditions': None,
                     'temperature': None,
                     'wind_speed': None,
@@ -221,52 +243,55 @@ class NFLDataCollector:
             self.db.bulk_insert_dataframe(games_df, 'games', if_exists='append')
         
         # Process player statistics
-        stats_data = []
-        
-        for _, row in weekly_stats.iterrows():
-            stat_data = {
-                'player_id': row.get('player_id', ''),
-                'game_id': row.get('game_id', ''),
-                'team_id': row.get('recent_team', ''),
-                
-                # Passing stats
-                'pass_attempts': row.get('attempts', 0) or 0,
-                'pass_completions': row.get('completions', 0) or 0,
-                'pass_yards': row.get('passing_yards', 0) or 0,
-                'pass_touchdowns': row.get('passing_tds', 0) or 0,
-                'pass_interceptions': row.get('interceptions', 0) or 0,
-                'pass_sacks': row.get('sacks', 0) or 0,
-                'pass_sack_yards': row.get('sack_yards', 0) or 0,
-                
-                # Rushing stats
-                'rush_attempts': row.get('carries', 0) or 0,
-                'rush_yards': row.get('rushing_yards', 0) or 0,
-                'rush_touchdowns': row.get('rushing_tds', 0) or 0,
-                'rush_fumbles': row.get('rushing_fumbles', 0) or 0,
-                
-                # Receiving stats
-                'receptions': row.get('receptions', 0) or 0,
-                'receiving_targets': row.get('targets', 0) or 0,
-                'receiving_yards': row.get('receiving_yards', 0) or 0,
-                'receiving_touchdowns': row.get('receiving_tds', 0) or 0,
-                'receiving_fumbles': row.get('receiving_fumbles', 0) or 0,
-                
-                # Advanced metrics
-                'target_share': row.get('target_share'),
-                'air_yards': row.get('receiving_air_yards', 0) or 0,
-                'yards_after_catch': row.get('receiving_yards_after_catch', 0) or 0,
-                
-                # Game context
-                'is_home': row.get('home_team') == row.get('recent_team'),
-            }
-            stats_data.append(stat_data)
-        
-        if stats_data:
-            stats_df = pd.DataFrame(stats_data)
-            # Remove rows with empty player_id or game_id
-            stats_df = stats_df.dropna(subset=['player_id', 'game_id'])
-            self.db.bulk_insert_dataframe(stats_df, 'game_stats', if_exists='append')
-            logger.info(f"Inserted {len(stats_df)} stat records for season {season}")
+        if not weekly_stats.empty:
+            # Clean up the data - the weekly data should already be one row per player per game
+            weekly_stats = weekly_stats.dropna(subset=['player_id'])
+            weekly_stats = weekly_stats[weekly_stats['player_id'] != '']
+            
+            # Convert to our database format
+            stats_data = []
+            for _, row in weekly_stats.iterrows():
+                stat_data = {
+                    'player_id': row['player_id'],
+                    'game_id': row['game_id'],
+                    'team_id': row['recent_team'],
+                    
+                    # Passing stats
+                    'pass_attempts': row.get('attempts', 0) or 0,
+                    'pass_completions': row.get('completions', 0) or 0,
+                    'pass_yards': row.get('passing_yards', 0) or 0,
+                    'pass_touchdowns': row.get('passing_tds', 0) or 0,
+                    'pass_interceptions': row.get('interceptions', 0) or 0,
+                    'pass_sacks': row.get('sacks', 0) or 0,
+                    'pass_sack_yards': row.get('sack_yards', 0) or 0,
+                    
+                    # Rushing stats
+                    'rush_attempts': row.get('carries', 0) or 0,
+                    'rush_yards': row.get('rushing_yards', 0) or 0,
+                    'rush_touchdowns': row.get('rushing_tds', 0) or 0,
+                    'rush_fumbles': row.get('rushing_fumbles', 0) or 0,
+                    
+                    # Receiving stats
+                    'receptions': row.get('receptions', 0) or 0,
+                    'receiving_targets': row.get('targets', 0) or 0,
+                    'receiving_yards': row.get('receiving_yards', 0) or 0,
+                    'receiving_touchdowns': row.get('receiving_tds', 0) or 0,
+                    'receiving_fumbles': row.get('receiving_fumbles', 0) or 0,
+                    
+                    # Advanced metrics
+                    'target_share': row.get('target_share'),
+                    'air_yards': row.get('receiving_air_yards', 0) or 0,
+                    'yards_after_catch': row.get('receiving_yards_after_catch', 0) or 0,
+                    
+                    # Game context - we can't determine home/away from weekly stats
+                    'is_home': None,
+                }
+                stats_data.append(stat_data)
+            
+            if stats_data:
+                stats_df = pd.DataFrame(stats_data)
+                self.db.bulk_insert_dataframe(stats_df, 'game_stats', if_exists='append')
+                logger.info(f"Inserted {len(stats_df)} stat records for season {season}")
     
     def setup_default_scoring_system(self):
         """Set up default fantasy scoring systems."""
