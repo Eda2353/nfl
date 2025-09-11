@@ -1,0 +1,75 @@
+FanDuel NFL Scoring Rules
+Offense:
+
+Reception: 0.5 points per catch
+
+Receiving/Rushing yards: 0.1 point per yard
+
+Passing yards: 0.04 points per yard
+
+Receiving/Rushing TD: 6 points
+
+Passing TD: 4 points
+
+Interception thrown: -1 point
+
+Fumble lost: -2 points
+
+Bonuses: 100+ receiving/rushing yards: 3 points, 300+ passing yards: 3 points
+
+Field Goals: 0-39 yards = 3 points, 40-49 yards = 4 points, 50+ yards = 5 points
+
+Extra Point: 1 point
+
+Defense/Special Teams:
+
+Sack: 1 point
+
+Fumble recovery: 2 points
+
+Interception: 2 points
+
+Kick/Punt Return TD: 6 points
+
+Safety: 2 points
+
+Points allowed: ranges from 10 points for 0 points allowed to -4 points for 35+ points allowed
+
+DraftKings NFL Scoring Rules
+Offense:
+
+Reception: 1 point per catch
+
+10 receiving/rushing yards: 1 point (+0.1 per yard)
+
+Passing yards: 0.04 points per yard
+
+Receiving/Rushing TD: 6 points
+
+Passing TD: 4 points
+
+Passing Interception: -1 point
+
+Fumble lost: -1 point
+
+Bonuses: 100+ receiving/rushing yards: 3 points, 300+ passing yards: 3 points
+
+2-point conversion (run/catch/pass): 2 points
+
+Defense/Special Teams:
+
+Sack: 1 point
+
+Interception: 2 points
+
+Fumble recovery: 2 points
+
+Kick/Punt Return/FG Return TD: 6 points
+
+Safety: 2 points
+
+Blocked Kick: 2 points
+
+Points allowed: 0 = 10 points, 1-6 = 7, 7-13 = 4, 14-20 = 1, 21-27 = 0, 28-34 = -1, 35+ = -4
+
+

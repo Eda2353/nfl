@@ -171,7 +171,20 @@ CREATE TABLE scoring_systems (
     sack_points DECIMAL(3,1) DEFAULT 1.0,
     int_points INTEGER DEFAULT 2,
     fumble_recovery_points INTEGER DEFAULT 2,
-    safety_points INTEGER DEFAULT 2
+    safety_points INTEGER DEFAULT 2,
+    
+    -- DST Points Allowed Scoring (tiered system)
+    dst_shutout_points INTEGER DEFAULT 10,     -- 0 points allowed
+    dst_1to6_points INTEGER DEFAULT 7,        -- 1-6 points allowed  
+    dst_7to13_points INTEGER DEFAULT 4,       -- 7-13 points allowed
+    dst_14to20_points INTEGER DEFAULT 1,      -- 14-20 points allowed
+    dst_21to27_points INTEGER DEFAULT 0,      -- 21-27 points allowed
+    dst_28to34_points INTEGER DEFAULT -1,     -- 28-34 points allowed
+    dst_35plus_points INTEGER DEFAULT -4,     -- 35+ points allowed
+    
+    -- DST Yardage bonuses
+    dst_under300_bonus INTEGER DEFAULT 0,     -- Under 300 yards allowed bonus
+    dst_under100_bonus INTEGER DEFAULT 0      -- Under 100 yards allowed bonus
 );
 
 -- Pre-calculated fantasy points for quick queries
@@ -189,9 +202,51 @@ CREATE TABLE fantasy_points (
     UNIQUE(player_id, game_id, system_id)
 );
 
+-- Team Defense/Special Teams statistics
+CREATE TABLE team_defense_stats (
+    id SERIAL PRIMARY KEY,
+    team_id VARCHAR(3),
+    game_id VARCHAR(20),
+    season_id INTEGER,
+    week INTEGER,
+    
+    -- Defensive stats
+    points_allowed INTEGER DEFAULT 0,
+    yards_allowed INTEGER DEFAULT 0,
+    passing_yards_allowed INTEGER DEFAULT 0,
+    rushing_yards_allowed INTEGER DEFAULT 0,
+    
+    -- Turnovers created
+    interceptions INTEGER DEFAULT 0,
+    fumbles_recovered INTEGER DEFAULT 0,
+    sacks DECIMAL(3,1) DEFAULT 0,
+    sack_yards INTEGER DEFAULT 0,
+    
+    -- Scoring plays
+    defensive_touchdowns INTEGER DEFAULT 0,
+    pick_six INTEGER DEFAULT 0,
+    fumble_touchdowns INTEGER DEFAULT 0,
+    safeties INTEGER DEFAULT 0,
+    
+    -- Special teams
+    blocked_kicks INTEGER DEFAULT 0,
+    return_touchdowns INTEGER DEFAULT 0,
+    
+    -- Game context
+    is_home BOOLEAN,
+    opponent_team_id VARCHAR(3),
+    
+    FOREIGN KEY (team_id) REFERENCES teams(team_id),
+    FOREIGN KEY (game_id) REFERENCES games(game_id),
+    FOREIGN KEY (opponent_team_id) REFERENCES teams(team_id),
+    
+    UNIQUE(team_id, game_id)
+);
+
 -- Indexes for performance
 CREATE INDEX idx_game_stats_player_season ON game_stats(player_id, game_id);
 CREATE INDEX idx_game_stats_game_date ON games(game_date);
 CREATE INDEX idx_game_stats_season_week ON games(season_id, week);
 CREATE INDEX idx_fantasy_points_lookup ON fantasy_points(player_id, system_id);
 CREATE INDEX idx_player_teams_season ON player_teams(player_id, season_id);
+CREATE INDEX idx_team_defense_season_week ON team_defense_stats(team_id, season_id, week);
