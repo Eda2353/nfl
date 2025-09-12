@@ -214,6 +214,15 @@ class MatchupAnalyzer:
         
         games_analyzed = len(recent_games)
         if games_analyzed > 0:
+            # Convert all columns to numeric to handle potential bytes values from database
+            recent_games['points_allowed'] = pd.to_numeric(recent_games['points_allowed'], errors='coerce').fillna(0)
+            recent_games['yards_allowed'] = pd.to_numeric(recent_games['yards_allowed'], errors='coerce').fillna(0)
+            recent_games['passing_yards_allowed'] = pd.to_numeric(recent_games['passing_yards_allowed'], errors='coerce').fillna(0)
+            recent_games['rushing_yards_allowed'] = pd.to_numeric(recent_games['rushing_yards_allowed'], errors='coerce').fillna(0)
+            recent_games['sacks'] = pd.to_numeric(recent_games['sacks'], errors='coerce').fillna(0)
+            recent_games['interceptions'] = pd.to_numeric(recent_games['interceptions'], errors='coerce').fillna(0)
+            recent_games['fumbles_recovered'] = pd.to_numeric(recent_games['fumbles_recovered'], errors='coerce').fillna(0)
+            
             defense.points_allowed_per_game = recent_games['points_allowed'].mean()
             defense.yards_allowed_per_game = recent_games['yards_allowed'].mean()
             defense.passing_yards_allowed_per_game = recent_games['passing_yards_allowed'].mean()
@@ -221,8 +230,7 @@ class MatchupAnalyzer:
             defense.sacks_per_game = recent_games['sacks'].mean()
             defense.interceptions_per_game = recent_games['interceptions'].mean()
             defense.fumbles_recovered_per_game = recent_games['fumbles_recovered'].mean()
-            defense.turnovers_forced_per_game = (recent_games['interceptions'] + 
-                                               recent_games['fumbles_recovered']).mean()
+            defense.turnovers_forced_per_game = (recent_games['interceptions'] + recent_games['fumbles_recovered']).mean()
             
             # Calculate overall defensive score (0-100 scale)
             # Lower points/yards allowed = better defense

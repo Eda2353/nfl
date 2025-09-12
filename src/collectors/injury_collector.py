@@ -182,7 +182,7 @@ class InjuryCollector:
             # Extract injury details from the injuries array
             injuries = injury_data.get('injuries', [])
             if not injuries:
-                self.logger.warning(f"No injuries array found for player: {player_name}")
+                self.logger.warning("No injuries array found in entry; skipping")
                 return None
             
             # Debug the injuries array structure
@@ -225,7 +225,6 @@ class InjuryCollector:
             if isinstance(status_info, dict):
                 status = status_info.get('name', 'Unknown')
             else:
-                self.logger.warning(f"Status info is not a dict: {type(status_info)} - {status_info}")
                 status = str(status_info) if status_info else 'Unknown'
             
             # Extract injury details - add safety check
@@ -347,7 +346,6 @@ class InjuryCollector:
                 if isinstance(status_info, dict):
                     status = status_info.get('name', 'Unknown')
                 else:
-                    self.logger.warning(f"Status info is not a dict: {type(status_info)} - {status_info}")
                     status = str(status_info) if status_info else 'Unknown'
                 
                 # Extract injury details - add safety check

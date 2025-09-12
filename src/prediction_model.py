@@ -610,7 +610,10 @@ class PlayerPredictor:
         recent_3 = historical_dst.head(3)
         features.avg_points_allowed_l3 = recent_3['points_allowed'].mean()
         features.avg_sacks_l3 = recent_3['sacks'].mean()
-        features.avg_turnovers_l3 = (recent_3['interceptions'] + recent_3['fumbles_recovered']).mean()
+        # Ensure numeric types for calculations
+        interceptions_l3 = pd.to_numeric(recent_3['interceptions'], errors='coerce').fillna(0)
+        fumbles_recovered_l3 = pd.to_numeric(recent_3['fumbles_recovered'], errors='coerce').fillna(0)
+        features.avg_turnovers_l3 = (interceptions_l3 + fumbles_recovered_l3).mean()
         features.avg_fantasy_points_l3 = recent_3['fantasy_points'].mean()
         
         # Season-to-date averages (current season only)
@@ -618,7 +621,10 @@ class PlayerPredictor:
         if not current_season_games.empty:
             features.avg_points_allowed_season = current_season_games['points_allowed'].mean()
             features.avg_sacks_season = current_season_games['sacks'].mean()
-            features.avg_turnovers_season = (current_season_games['interceptions'] + current_season_games['fumbles_recovered']).mean()
+            # Ensure numeric types for calculations
+            interceptions_season = pd.to_numeric(current_season_games['interceptions'], errors='coerce').fillna(0)
+            fumbles_recovered_season = pd.to_numeric(current_season_games['fumbles_recovered'], errors='coerce').fillna(0)
+            features.avg_turnovers_season = (interceptions_season + fumbles_recovered_season).mean()
             features.avg_fantasy_points_season = current_season_games['fantasy_points'].mean()
             features.games_played_season = len(current_season_games)
         

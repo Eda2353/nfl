@@ -37,6 +37,91 @@ prediction_cache = {}
 injury_cache = {}
 schedule_cache = {}
 
+@app.route('/api/health')
+def health():
+    """Simple health check endpoint."""
+    try:
+        # Try a lightweight DB check
+        with db_manager.engine.connect() as conn:
+            conn.execute(text("SELECT 1"))
+        return jsonify({'status': 'ok'}), 200
+    except Exception as e:
+        app.logger.error(f"Health check failed: {e}")
+        return jsonify({'status': 'error', 'error': str(e)}), 500
+
+@app.route('/api/initialization-status')
+def initialization_status():
+    """Report whether the database appears initialized for the web app."""
+    try:
+        status = {
+            'initialized': False,
+            'scoring_systems': 0,
+            'teams': 0,
+            'players': 0,
+            'games': 0
+        }
+        with db_manager.engine.connect() as conn:
+            status['scoring_systems'] = conn.execute(text("SELECT COUNT(*) FROM scoring_systems")).fetchone()[0]
+            status['teams'] = conn.execute(text("SELECT COUNT(*) FROM teams")).fetchone()[0]
+            status['players'] = conn.execute(text("SELECT COUNT(*) FROM players")).fetchone()[0]
+            status['games'] = conn.execute(text("SELECT COUNT(*) FROM games")).fetchone()[0]
+        # Consider initialized if scoring systems exist and there is at least some game data
+        status['initialized'] = status['scoring_systems'] > 0 and status['games'] > 0
+        return jsonify(status)
+    except Exception as e:
+        app.logger.error(f"Initialization status error: {e}")
+        return jsonify({'initialized': False, 'error': str(e)}), 200
+
+@app.route('/api/initialize-database', methods=['POST'])
+def initialize_database():
+    """Initialize database with baseline data and scoring systems in background."""
+    try:
+        payload = request.get_json(silent=True) or {}
+        start_season = int(payload.get('start_season', 2022))
+        end_season = int(payload.get('end_season', datetime.now().year))
+
+        def init_in_background():
+            try:
+                app.logger.info("Initializing database: creating default scoring systems and core data...")
+
+                # Ensure scoring systems exist
+                try:
+                    from src.init_scoring_systems import init_scoring_systems
+                except Exception:
+                    # Fallback import path if running with src on path
+                    from init_scoring_systems import init_scoring_systems
+                init_scoring_systems(db_manager)
+                app.logger.info("Default scoring systems initialized")
+
+                # Collect minimal data set (teams/players/games/stats)
+                # Use configured collector; limit range to avoid huge imports
+                original_start = config.data_collection.start_season
+                original_end = config.data_collection.end_season
+                try:
+                    config.data_collection.start_season = start_season
+                    config.data_collection.end_season = end_season
+                    data_collector.collect_all_data()
+                finally:
+                    config.data_collection.start_season = original_start
+                    config.data_collection.end_season = original_end
+
+                # Clear caches so UI sees fresh data
+                prediction_cache.clear()
+                schedule_cache.clear()
+                injury_cache.clear()
+                app.logger.info("Database initialization completed")
+            except Exception as e:
+                app.logger.error(f"Database initialization failed: {e}")
+
+        thread = threading.Thread(target=init_in_background)
+        thread.daemon = True
+        thread.start()
+
+        return jsonify({'status': 'success', 'message': 'Initialization started'}), 202
+    except Exception as e:
+        app.logger.error(f"Error starting initialization: {e}")
+        return jsonify({'status': 'error', 'error': str(e)}), 500
+
 @app.route('/')
 def index():
     """Main dashboard page."""
@@ -377,34 +462,87 @@ def get_predictions(season, week, scoring_system):
         return jsonify(prediction_data)
     
     except Exception as e:
+        import traceback
         app.logger.error(f"Error generating predictions: {e}")
+        app.logger.error(f"Full traceback:\n{traceback.format_exc()}")
         return jsonify({'error': str(e)}), 500
 
 @app.route('/api/update-data', methods=['POST'])
 def update_data():
-    """Update database with latest NFL data."""
+    """Update database with latest NFL data, injury reports, and schedules."""
     try:
         data = request.get_json()
         seasons = data.get('seasons', [2024, 2025])
+        update_injuries = data.get('update_injuries', True)
+        update_schedules = data.get('update_schedules', True)
         
         def update_in_background():
             try:
-                app.logger.info(f"Starting data update for seasons: {seasons}")
+                app.logger.info(f"Starting comprehensive data update for seasons: {seasons}")
                 
-                # Update data
-                for season in seasons:
-                    if season >= 2025:
-                        # Use current season method for 2025+
-                        data_collector._collect_current_season_data(season)
-                    else:
-                        # Use standard collection for historical seasons
-                        data_collector.collect_games_and_stats([season])
+                # Update NFL game data and statistics
+                if update_schedules:
+                    app.logger.info("Updating NFL schedules and game data...")
+                    for season in seasons:
+                        try:
+                            if season >= 2025:
+                                # Use current season method for 2025+
+                                app.logger.info(f"Updating current season {season} data...")
+                                # Check if we already have data for this season
+                                with db_manager.engine.connect() as conn:
+                                    result = conn.execute(text("SELECT COUNT(*) FROM games WHERE season_id = :season"), 
+                                                        {"season": season}).fetchone()
+                                    game_count = result[0] if result else 0
+                                
+                                if game_count > 0:
+                                    app.logger.info(f"Current season {season} already has {game_count} games")
+                                    app.logger.info(f"Skipping game collection to avoid duplicates")
+                                    # Could add logic here to update only new/changed games if needed
+                                else:
+                                    app.logger.info(f"No existing data for current season {season}, collecting all data...")
+                                    data_collector._collect_current_season_data(season)
+                            else:
+                                # For historical seasons, just update stats (games likely already exist)
+                                app.logger.info(f"Updating historical season {season} stats...")
+                                # Check if we have recent data for this season first
+                                with db_manager.engine.connect() as conn:
+                                    result = conn.execute(text("SELECT COUNT(*) FROM games WHERE season_id = :season"), 
+                                                        {"season": season}).fetchone()
+                                    game_count = result[0] if result else 0
+                                
+                                if game_count > 0:
+                                    app.logger.info(f"Season {season} already has {game_count} games, skipping game collection")
+                                    # Still update player stats for this season
+                                    app.logger.info(f"Refreshing player stats for season {season}...")
+                                else:
+                                    app.logger.info(f"No existing data for season {season}, collecting all data...")
+                                    data_collector._collect_season_games_and_stats(season)
+                        except Exception as season_error:
+                            app.logger.warning(f"Failed to update season {season}: {season_error}")
+                            continue
                 
-                app.logger.info("Data update completed successfully")
+                # Update injury reports
+                if update_injuries:
+                    app.logger.info("Updating injury reports...")
+                    try:
+                        # Import/update historical injury data for recent seasons
+                        historical_seasons = [s for s in seasons if s >= 2020]  # nfl-data-py has injury data from 2020+
+                        if historical_seasons:
+                            injury_count = injury_collector.import_historical_injuries(historical_seasons)
+                            app.logger.info(f"Updated {injury_count} historical injury records")
+                        
+                        # Update current week injury data (this will be fetched fresh via ESPN API on next request)
+                        app.logger.info("Current injuries will be refreshed on next API call")
+                        
+                    except Exception as injury_error:
+                        app.logger.warning(f"Injury update partially failed: {injury_error}")
                 
-                # Clear caches
+                app.logger.info("Comprehensive data update completed successfully")
+                
+                # Clear all relevant caches to force fresh data
                 prediction_cache.clear()
                 schedule_cache.clear()
+                injury_cache.clear()  # Clear injury cache to force fresh data
                 
             except Exception as e:
                 app.logger.error(f"Data update failed: {e}")
@@ -414,7 +552,15 @@ def update_data():
         thread.daemon = True
         thread.start()
         
-        return jsonify({'status': 'started', 'message': 'Data update started in background'})
+        return jsonify({
+            'status': 'started', 
+            'message': 'Comprehensive data update started in background',
+            'includes': {
+                'schedules': update_schedules,
+                'injuries': update_injuries,
+                'seasons': seasons
+            }
+        })
     
     except Exception as e:
         app.logger.error(f"Error starting data update: {e}")

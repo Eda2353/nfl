@@ -5,6 +5,9 @@ numpy
 requests
 beautifulsoup4
 
+# Web
+Flask
+
 # Database
 sqlalchemy
 psycopg2-binary

@@ -30,6 +30,7 @@ class NFLFantasyApp {
         document.getElementById('get-predictions')?.addEventListener('click', () => this.getPredictions());
         document.getElementById('refresh-injuries')?.addEventListener('click', () => this.showInjuryReport());
         document.getElementById('update-data')?.addEventListener('click', () => this.updateData());
+        document.getElementById('initialize-database')?.addEventListener('click', () => this.initializeDatabase());
         
         // Form inputs
         document.getElementById('scoring-system')?.addEventListener('change', (e) => {
@@ -62,6 +63,9 @@ class NFLFantasyApp {
     }
 
     async loadInitialData() {
+        // Check initialization status first
+        await this.checkInitializationStatus();
+        
         // Load scoring systems
         await this.loadScoringSystems();
         
@@ -87,6 +91,10 @@ class NFLFantasyApp {
             
             const select = document.getElementById('scoring-system');
             if (select && systems && systems.length > 0) {
+                // If the current default isn't available, fall back to the first system
+                if (!systems.includes(this.currentScoring)) {
+                    this.currentScoring = systems[0];
+                }
                 select.innerHTML = systems.map(system => 
                     `<option value="${system}" ${system === this.currentScoring ? 'selected' : ''}>${system}</option>`
                 ).join('');
@@ -557,6 +565,99 @@ class NFLFantasyApp {
             if (parseInt(seasonSelect.value) === currentYear && parseInt(weekSelect.value) < currentWeek - 1) {
                 weekSelect.value = Math.max(currentWeek - 1, 1);
             }
+        }
+    }
+    
+    async checkInitializationStatus() {
+        try {
+            const response = await fetch('/api/initialization-status');
+            const data = await response.json();
+            
+            const initButton = document.getElementById('initialize-database');
+            const otherButtons = document.querySelectorAll('#get-predictions, #refresh-injuries, #update-data');
+            
+            if (data.initialized) {
+                // Hide initialize button, show other buttons
+                if (initButton) initButton.style.display = 'none';
+                otherButtons.forEach(btn => {
+                    if (btn) btn.style.display = 'inline-flex';
+                });
+            } else {
+                // Show initialize button, hide other buttons
+                if (initButton) initButton.style.display = 'inline-flex';
+                otherButtons.forEach(btn => {
+                    if (btn) btn.style.display = 'none';
+                });
+            }
+        } catch (error) {
+            console.error('❌ Error checking initialization status:', error);
+        }
+    }
+    
+    async initializeDatabase() {
+        const button = document.getElementById('initialize-database');
+        
+        try {
+            // Update button to show processing
+            button.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Initializing...';
+            button.disabled = true;
+            
+            this.showStatus('Starting database initialization...', 'info');
+            
+            const response = await fetch('/api/initialize-database', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json'
+                },
+                body: JSON.stringify({})
+            });
+            
+            if (!response.ok) {
+                throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+            }
+            
+            const result = await response.json();
+            
+            if (result.status === 'success') {
+                this.showStatus('Database initialization started successfully! This may take several minutes...', 'success');
+                
+                // Poll for completion
+                setTimeout(() => this.pollInitializationStatus(), 5000);
+                
+            } else {
+                throw new Error(result.message || 'Unknown error');
+            }
+        } catch (error) {
+            console.error('❌ Error initializing database:', error);
+            this.showStatus(`Error initializing database: ${error.message}`, 'error');
+            
+            // Reset button
+            button.innerHTML = '<i class="fas fa-rocket"></i> Initialize Database';
+            button.disabled = false;
+        }
+    }
+    
+    async pollInitializationStatus() {
+        try {
+            const response = await fetch('/api/initialization-status');
+            const data = await response.json();
+            
+            if (data.initialized) {
+                this.showStatus('Database initialization completed successfully!', 'success');
+                
+                // Hide the initialize button and show other controls
+                await this.checkInitializationStatus();
+                
+                // Reload page data
+                await this.loadInitialData();
+                
+            } else {
+                // Continue polling
+                setTimeout(() => this.pollInitializationStatus(), 10000);
+            }
+        } catch (error) {
+            console.error('❌ Error polling initialization status:', error);
+            setTimeout(() => this.pollInitializationStatus(), 10000);
         }
     }
 }

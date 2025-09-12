@@ -43,6 +43,11 @@ class DatabaseManager:
         
         self.engine = create_engine(connection_string)
         self._create_tables()
+        # Ensure default scoring systems exist
+        try:
+            self._init_scoring_systems()
+        except Exception as e:
+            logger.warning(f"Scoring system initialization skipped: {e}")
     
     def _create_tables(self):
         """Create database tables from schema file."""
@@ -51,6 +56,10 @@ class DatabaseManager:
         try:
             with open(schema_path, 'r') as f:
                 schema_sql = f.read()
+            
+            # Replace CREATE TABLE with CREATE TABLE IF NOT EXISTS
+            schema_sql = schema_sql.replace('CREATE TABLE', 'CREATE TABLE IF NOT EXISTS')
+            schema_sql = schema_sql.replace('CREATE INDEX', 'CREATE INDEX IF NOT EXISTS')
             
             # Split by semicolon and execute each statement
             statements = [stmt.strip() for stmt in schema_sql.split(';') if stmt.strip()]
@@ -70,9 +79,19 @@ class DatabaseManager:
             logger.error(f"Schema file not found: {schema_path}")
             raise
     
+    def _init_scoring_systems(self):
+        """Initialize default scoring systems."""
+        try:
+            from .init_scoring_systems import init_scoring_systems
+        except ImportError:
+            from init_scoring_systems import init_scoring_systems
+        
+        init_scoring_systems(self)
+    
     def execute_query(self, query: str, params=None) -> pd.DataFrame:
         """Execute a SELECT query and return results as DataFrame."""
-        return pd.read_sql_query(query, self.engine, params=params)
+        with self.engine.connect() as conn:
+            return pd.read_sql_query(query, conn, params=params)
     
     def execute_statement(self, statement: str, params=None):
         """Execute an INSERT/UPDATE/DELETE statement."""

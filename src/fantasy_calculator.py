@@ -48,11 +48,44 @@ class FantasyCalculator:
         with self.db.engine.connect() as conn:
             from sqlalchemy import text
             systems_df = pd.read_sql_query(text("SELECT * FROM scoring_systems"), conn)
-            
+        
         self.scoring_systems = {}
         
-        for _, row in systems_df.iterrows():
-            self.scoring_systems[row['system_name']] = row.to_dict()
+        if systems_df is not None and not systems_df.empty:
+            for _, row in systems_df.iterrows():
+                self.scoring_systems[row['system_name']] = row.to_dict()
+        else:
+            # Fallback in-memory defaults to prevent runtime failures if DB is empty
+            self.scoring_systems = {
+                'FanDuel': {
+                    'system_name': 'FanDuel',
+                    'pass_yard_points': 0.04,
+                    'pass_td_points': 4,
+                    'pass_int_points': -1,
+                    'rush_yard_points': 0.1,
+                    'rush_td_points': 6,
+                    'reception_points': 0.5,
+                    'receiving_yard_points': 0.1,
+                    'receiving_td_points': 6,
+                    'fumble_points': -2,
+                    'field_goal_points': 3,
+                    'extra_point_points': 1,
+                    'defensive_td_points': 6,
+                    'sack_points': 1.0,
+                    'int_points': 2,
+                    'fumble_recovery_points': 2,
+                    'safety_points': 2,
+                    'dst_shutout_points': 10,
+                    'dst_1to6_points': 7,
+                    'dst_7to13_points': 4,
+                    'dst_14to20_points': 1,
+                    'dst_21to27_points': 0,
+                    'dst_28to34_points': -1,
+                    'dst_35plus_points': -4,
+                    'dst_under300_bonus': 0,
+                    'dst_under100_bonus': 0
+                }
+            }
     
     def calculate_player_points(self, game_stats: pd.Series, scoring_system: str) -> FantasyPoints:
         """Calculate fantasy points for a single player's game stats."""
@@ -60,32 +93,47 @@ class FantasyCalculator:
         if scoring_system not in self.scoring_systems:
             raise ValueError(f"Unknown scoring system: {scoring_system}")
         
+        # Helper function to safely convert values to numeric
+        def safe_numeric(value, default=0):
+            """Convert any value to a numeric type safely."""
+            if value is None:
+                return default
+            if isinstance(value, bytes):
+                try:
+                    value = value.decode('utf-8')
+                except:
+                    return default
+            try:
+                return float(value)
+            except (ValueError, TypeError):
+                return default
+        
         system = self.scoring_systems[scoring_system]
         points = FantasyPoints(total_points=0.0)
         
         # Passing points
-        points.passing_points += (game_stats.get('pass_yards', 0) or 0) * system['pass_yard_points']
-        points.passing_points += (game_stats.get('pass_touchdowns', 0) or 0) * system['pass_td_points']
+        points.passing_points += safe_numeric(game_stats.get('pass_yards', 0)) * system['pass_yard_points']
+        points.passing_points += safe_numeric(game_stats.get('pass_touchdowns', 0)) * system['pass_td_points']
         
         # Rushing points
-        points.rushing_points += (game_stats.get('rush_yards', 0) or 0) * system['rush_yard_points']
-        points.rushing_points += (game_stats.get('rush_touchdowns', 0) or 0) * system['rush_td_points']
+        points.rushing_points += safe_numeric(game_stats.get('rush_yards', 0)) * system['rush_yard_points']
+        points.rushing_points += safe_numeric(game_stats.get('rush_touchdowns', 0)) * system['rush_td_points']
         
         # Receiving points
-        points.receiving_points += (game_stats.get('receptions', 0) or 0) * system['reception_points']
-        points.receiving_points += (game_stats.get('receiving_yards', 0) or 0) * system['receiving_yard_points']
-        points.receiving_points += (game_stats.get('receiving_touchdowns', 0) or 0) * system['receiving_td_points']
+        points.receiving_points += safe_numeric(game_stats.get('receptions', 0)) * system['reception_points']
+        points.receiving_points += safe_numeric(game_stats.get('receiving_yards', 0)) * system['receiving_yard_points']
+        points.receiving_points += safe_numeric(game_stats.get('receiving_touchdowns', 0)) * system['receiving_td_points']
         
         # Penalties (negative points)
-        points.penalty_points += (game_stats.get('pass_interceptions', 0) or 0) * system['pass_int_points']
-        fumbles_lost = (game_stats.get('rush_fumbles', 0) or 0) + (game_stats.get('receiving_fumbles', 0) or 0)
+        points.penalty_points += safe_numeric(game_stats.get('pass_interceptions', 0)) * system['pass_int_points']
+        fumbles_lost = safe_numeric(game_stats.get('rush_fumbles', 0)) + safe_numeric(game_stats.get('receiving_fumbles', 0))
         points.penalty_points += fumbles_lost * system['fumble_points']
         
         # Bonuses (FanDuel/DraftKings specific)
         if scoring_system in ['FanDuel', 'DraftKings']:
             # 100+ rushing/receiving yards bonus
-            rush_yards = game_stats.get('rush_yards', 0) or 0
-            receiving_yards = game_stats.get('receiving_yards', 0) or 0
+            rush_yards = safe_numeric(game_stats.get('rush_yards', 0))
+            receiving_yards = safe_numeric(game_stats.get('receiving_yards', 0))
             
             if rush_yards >= 100:
                 points.bonus_points += 3
@@ -93,7 +141,7 @@ class FantasyCalculator:
                 points.bonus_points += 3
                 
             # 300+ passing yards bonus
-            pass_yards = game_stats.get('pass_yards', 0) or 0
+            pass_yards = safe_numeric(game_stats.get('pass_yards', 0))
             if pass_yards >= 300:
                 points.bonus_points += 3
         
@@ -114,54 +162,72 @@ class FantasyCalculator:
         if scoring_system not in self.scoring_systems:
             raise ValueError(f"Unknown scoring system: {scoring_system}")
         
+        # Helper function to safely convert values to numeric
+        def safe_numeric(value, default=0):
+            """Convert any value to a numeric type safely."""
+            if value is None:
+                return default
+            if isinstance(value, bytes):
+                try:
+                    value = value.decode('utf-8')
+                except:
+                    return default
+            try:
+                return float(value)
+            except (ValueError, TypeError):
+                return default
+        
         system = self.scoring_systems[scoring_system]
         points = DSTFantasyPoints(total_points=0.0)
         
         # Points allowed scoring (tiered system)
-        points_allowed = defense_stats.get('points_allowed', 0) or 0
+        points_allowed = safe_numeric(defense_stats.get('points_allowed', 0))
         
+        # Helper for compatibility between schema keys and older DST key names
+        def sysval(new_key, old_key, default):
+            return system.get(new_key, system.get(old_key, default))
+
         if points_allowed == 0:
-            points.points_allowed_score = system.get('dst_shutout_points', 10)
+            points.points_allowed_score = sysval('dst_shutout_points', 'dst_points_allowed_0_points', 10)
         elif points_allowed <= 6:
-            points.points_allowed_score = system.get('dst_1to6_points', 7)
+            points.points_allowed_score = sysval('dst_1to6_points', 'dst_points_allowed_1_6_points', 7)
         elif points_allowed <= 13:
-            points.points_allowed_score = system.get('dst_7to13_points', 4)
+            points.points_allowed_score = sysval('dst_7to13_points', 'dst_points_allowed_7_13_points', 4)
         elif points_allowed <= 20:
-            points.points_allowed_score = system.get('dst_14to20_points', 1)
+            points.points_allowed_score = sysval('dst_14to20_points', 'dst_points_allowed_14_20_points', 1)
         elif points_allowed <= 27:
-            points.points_allowed_score = system.get('dst_21to27_points', 0)
+            points.points_allowed_score = sysval('dst_21to27_points', 'dst_points_allowed_21_27_points', 0)
         elif points_allowed <= 34:
-            points.points_allowed_score = system.get('dst_28to34_points', -1)
+            points.points_allowed_score = sysval('dst_28to34_points', 'dst_points_allowed_28_34_points', -1)
         else:
-            points.points_allowed_score = system.get('dst_35plus_points', -4)
+            points.points_allowed_score = sysval('dst_35plus_points', 'dst_points_allowed_35_points', -4)
         
         # Defensive turnovers and sacks
-        interceptions = defense_stats.get('interceptions', 0) or 0
-        fumbles_recovered = defense_stats.get('fumbles_recovered', 0) or 0
-        sacks = defense_stats.get('sacks', 0) or 0
+        interceptions = safe_numeric(defense_stats.get('interceptions', 0))
+        fumbles_recovered = safe_numeric(defense_stats.get('fumbles_recovered', 0))
+        sacks = safe_numeric(defense_stats.get('sacks', 0))
         
-        points.turnovers_score += interceptions * system.get('int_points', 2)
-        points.turnovers_score += fumbles_recovered * system.get('fumble_recovery_points', 2)
-        points.sacks_score += sacks * system.get('sack_points', 1.0)
+        points.turnovers_score += interceptions * sysval('int_points', 'dst_interception_points', 2)
+        points.turnovers_score += fumbles_recovered * sysval('fumble_recovery_points', 'dst_fumble_recovery_points', 2)
+        points.sacks_score += sacks * sysval('sack_points', 'dst_sack_points', 1.0)
         
         # Defensive/special teams touchdowns
-        defensive_tds = defense_stats.get('defensive_touchdowns', 0) or 0
-        pick_six = defense_stats.get('pick_six', 0) or 0
-        fumble_tds = defense_stats.get('fumble_touchdowns', 0) or 0
-        return_tds = defense_stats.get('return_touchdowns', 0) or 0
+        defensive_tds = safe_numeric(defense_stats.get('defensive_touchdowns', 0))
+        pick_six = safe_numeric(defense_stats.get('pick_six', 0))
+        fumble_tds = safe_numeric(defense_stats.get('fumble_touchdowns', 0))
+        return_tds = safe_numeric(defense_stats.get('return_touchdowns', 0))
         
         total_tds = defensive_tds + pick_six + fumble_tds + return_tds
-        points.touchdowns_score += total_tds * system.get('defensive_td_points', 6)
+        points.touchdowns_score += total_tds * sysval('defensive_td_points', 'dst_touchdown_points', 6)
         
         # Safeties
-        safeties = defense_stats.get('safeties', 0) or 0
-        points.safety_score += safeties * system.get('safety_points', 2)
+        safeties = safe_numeric(defense_stats.get('safeties', 0))
+        points.safety_score += safeties * sysval('safety_points', 'dst_safety_points', 2)
         
         # Yardage bonuses (if implemented)
-        yards_allowed = defense_stats.get('yards_allowed', 0) or 0
-        # Convert to int if it's not already (handle potential data type issues)
+        yards_allowed = safe_numeric(defense_stats.get('yards_allowed', 0))
+        
         try:
-            yards_allowed = int(yards_allowed) if yards_allowed is not None else 0
             if yards_allowed < 100:
                 points.bonus_score += system.get('dst_under100_bonus', 0)
             elif yards_allowed < 300:
