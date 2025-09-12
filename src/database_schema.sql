@@ -243,6 +243,29 @@ CREATE TABLE team_defense_stats (
     UNIQUE(team_id, game_id)
 );
 
+-- Historical Injury Reports (from nfl-data-py)
+CREATE TABLE historical_injuries (
+    id SERIAL PRIMARY KEY,
+    season INTEGER NOT NULL,
+    game_type VARCHAR(10) DEFAULT 'REG',
+    team VARCHAR(3) NOT NULL,
+    week INTEGER NOT NULL,
+    gsis_id VARCHAR(20),
+    position VARCHAR(5),
+    full_name VARCHAR(100),
+    first_name VARCHAR(50),
+    last_name VARCHAR(50),
+    report_primary_injury VARCHAR(100),
+    report_secondary_injury VARCHAR(100),
+    report_status VARCHAR(50),
+    practice_primary_injury VARCHAR(100),
+    practice_secondary_injury VARCHAR(100),
+    practice_status VARCHAR(100),
+    date_modified TIMESTAMP,
+    
+    UNIQUE(season, week, gsis_id, date_modified)
+);
+
 -- Indexes for performance
 CREATE INDEX idx_game_stats_player_season ON game_stats(player_id, game_id);
 CREATE INDEX idx_game_stats_game_date ON games(game_date);
@@ -250,3 +273,6 @@ CREATE INDEX idx_game_stats_season_week ON games(season_id, week);
 CREATE INDEX idx_fantasy_points_lookup ON fantasy_points(player_id, system_id);
 CREATE INDEX idx_player_teams_season ON player_teams(player_id, season_id);
 CREATE INDEX idx_team_defense_season_week ON team_defense_stats(team_id, season_id, week);
+CREATE INDEX idx_historical_injuries_lookup ON historical_injuries(season, week, team);
+CREATE INDEX idx_historical_injuries_player ON historical_injuries(gsis_id, season);
+CREATE INDEX idx_historical_injuries_status ON historical_injuries(report_status);

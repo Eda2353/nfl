@@ -356,7 +356,8 @@ class PlayerPredictor:
                 print(f"Insufficient data for {position}: {len(data)} examples")
                 continue
             
-            # Prepare features and target
+            # Prepare features - use base features only for historical compatibility
+            # Position-specific features will be added for future enhanced training
             X = data[self.feature_columns].fillna(0)
             y = data['target']
             
@@ -401,6 +402,9 @@ class PlayerPredictor:
             self.models[position] = best_model
             print(f"Best model for {position}: MAE={best_score:.2f}")
         
+        # Mark that current models only support base features (historical compatibility)
+        self.supports_position_features = False
+        
         # Train DST model
         print("\n" + "="*50)
         print("Training DST model...")
@@ -444,19 +448,34 @@ class PlayerPredictor:
             features.trend_score
         ]
         
-        # Add position-specific matchup features in consistent order
-        position_specific_order = self._get_position_feature_order(position)
-        for feature_name in position_specific_order:
-            value = features.position_matchup_features.get(feature_name, 0.0)
-            base_features.append(value)
+        # Add position-specific matchup features if available and models support them
+        # For backward compatibility with models trained on historical data
+        if hasattr(self, 'supports_position_features') and self.supports_position_features:
+            position_specific_order = self._get_position_feature_order(position)
+            for feature_name in position_specific_order:
+                value = features.position_matchup_features.get(feature_name, 0.0) if features.position_matchup_features else 0.0
+                base_features.append(value)
         
         feature_vector = base_features
         
-        X = np.array(feature_vector).reshape(1, -1)
+        # Create feature array - use pandas DataFrame to preserve feature names for scaler
+        feature_names = [
+            'avg_fantasy_points_l3', 'avg_targets_l3', 'avg_carries_l3', 
+            'avg_passing_attempts_l3', 'avg_fantasy_points_season', 'games_played_season',
+            'position_encoded', 'target_share_l3', 'consistency_score', 'trend_score'
+        ]
+        
+        if hasattr(self, 'supports_position_features') and self.supports_position_features:
+            position_specific_order = self._get_position_feature_order(position)
+            feature_names.extend(position_specific_order)
+        
+        X = pd.DataFrame([feature_vector], columns=feature_names[:len(feature_vector)])
         
         # Scale if using Ridge regression
         if isinstance(self.models[position], Ridge):
             X = self.scalers[position].transform(X)
+        else:
+            X = X.values
         
         # Make prediction
         prediction = self.models[position].predict(X)[0]

@@ -185,7 +185,11 @@ class NFLDataCollector:
         
         for season in tqdm(seasons, desc="Collecting game data and stats"):
             try:
-                self._collect_season_games_and_stats(season)
+                # Use different collection method for current season (2025+)
+                if season >= 2025:
+                    self._collect_current_season_data(season)
+                else:
+                    self._collect_season_games_and_stats(season)
                 time.sleep(self.config.data_collection.rate_limit_delay)
                 
             except Exception as e:
@@ -292,6 +296,158 @@ class NFLDataCollector:
                 stats_df = pd.DataFrame(stats_data)
                 self.db.bulk_insert_dataframe(stats_df, 'game_stats', if_exists='append')
                 logger.info(f"Inserted {len(stats_df)} stat records for season {season}")
+    
+    def _collect_current_season_data(self, season: int):
+        """Collect current season data using alternative data sources (PBP + snap counts)."""
+        logger.info(f"Collecting current season {season} data using play-by-play and snap counts")
+        
+        try:
+            # Get play-by-play data for current season
+            pbp_data = nfl.import_pbp_data([season])
+            
+            if pbp_data.empty:
+                logger.warning(f"No play-by-play data found for season {season}")
+                return
+            
+            # Get schedules for proper game info
+            schedules = nfl.import_schedules([season])
+            
+            # Process games from schedules (more complete than PBP)
+            games_data = []
+            for _, game in schedules.iterrows():
+                game_data = {
+                    'game_id': game['game_id'],
+                    'season_id': season,
+                    'week': game['week'],
+                    'game_date': game.get('gameday'),
+                    'home_team_id': game['home_team'],
+                    'away_team_id': game['away_team'],
+                    'home_score': game.get('home_score'),
+                    'away_score': game.get('away_score'),
+                    'weather_conditions': None,
+                    'temperature': None,
+                    'wind_speed': None,
+                    'is_dome': None,
+                    'game_time': game.get('gametime')
+                }
+                games_data.append(game_data)
+            
+            if games_data:
+                games_df = pd.DataFrame(games_data)
+                self.db.bulk_insert_dataframe(games_df, 'games', if_exists='append')
+                logger.info(f"Inserted {len(games_df)} games for season {season}")
+            
+            # Aggregate player stats from play-by-play data
+            player_stats = self._aggregate_pbp_player_stats(pbp_data, season)
+            
+            if not player_stats.empty:
+                self.db.bulk_insert_dataframe(player_stats, 'game_stats', if_exists='append')
+                logger.info(f"Inserted {len(player_stats)} stat records for season {season}")
+                
+        except Exception as e:
+            logger.error(f"Error collecting current season {season} data: {e}")
+            raise
+    
+    def _aggregate_pbp_player_stats(self, pbp_data: pd.DataFrame, season: int) -> pd.DataFrame:
+        """Aggregate player statistics from play-by-play data."""
+        
+        stats_records = []
+        
+        # Group by game and player to aggregate stats
+        games = pbp_data['game_id'].unique()
+        
+        for game_id in games:
+            game_plays = pbp_data[pbp_data['game_id'] == game_id]
+            week = game_plays['week'].iloc[0]
+            
+            # Get all players who participated in this game
+            all_players = set()
+            
+            # Collect player IDs from different play types
+            for col in ['passer_player_id', 'rusher_player_id', 'receiver_player_id']:
+                if col in game_plays.columns:
+                    players = game_plays[col].dropna().unique()
+                    all_players.update(players)
+            
+            # Aggregate stats for each player
+            for player_id in all_players:
+                if pd.isna(player_id) or player_id == '':
+                    continue
+                
+                player_plays = game_plays[
+                    (game_plays['passer_player_id'] == player_id) |
+                    (game_plays['rusher_player_id'] == player_id) |
+                    (game_plays['receiver_player_id'] == player_id)
+                ]
+                
+                if player_plays.empty:
+                    continue
+                
+                # Get team (use possession team from most plays)
+                team_id = player_plays['posteam'].mode().iloc[0] if not player_plays['posteam'].mode().empty else None
+                
+                # Aggregate passing stats
+                pass_plays = game_plays[game_plays['passer_player_id'] == player_id]
+                pass_attempts = len(pass_plays[pass_plays['pass_attempt'] == 1])
+                completions = len(pass_plays[pass_plays['complete_pass'] == 1])
+                pass_yards = pass_plays['passing_yards'].sum()
+                pass_tds = len(pass_plays[pass_plays['pass_touchdown'] == 1])
+                interceptions = len(pass_plays[pass_plays['interception'] == 1])
+                
+                # Aggregate rushing stats  
+                rush_plays = game_plays[game_plays['rusher_player_id'] == player_id]
+                rush_attempts = len(rush_plays[rush_plays['rush_attempt'] == 1])
+                rush_yards = rush_plays['rushing_yards'].sum()
+                rush_tds = len(rush_plays[rush_plays['rush_touchdown'] == 1])
+                
+                # Aggregate receiving stats
+                rec_plays = game_plays[game_plays['receiver_player_id'] == player_id]
+                receptions = len(rec_plays[rec_plays['complete_pass'] == 1])
+                receiving_yards = rec_plays['receiving_yards'].sum() 
+                receiving_tds = len(rec_plays[rec_plays['pass_touchdown'] == 1])
+                air_yards = rec_plays['air_yards'].sum()
+                yac = rec_plays['yards_after_catch'].sum()
+                
+                # Only add records for players with meaningful stats
+                if (pass_attempts > 0 or rush_attempts > 0 or receptions > 0):
+                    stat_record = {
+                        'player_id': player_id,
+                        'game_id': game_id,
+                        'team_id': team_id,
+                        
+                        # Passing stats
+                        'pass_attempts': pass_attempts,
+                        'pass_completions': completions,
+                        'pass_yards': int(pass_yards) if not pd.isna(pass_yards) else 0,
+                        'pass_touchdowns': pass_tds,
+                        'pass_interceptions': interceptions,
+                        'pass_sacks': 0,  # Not easily extractable from PBP
+                        'pass_sack_yards': 0,
+                        
+                        # Rushing stats
+                        'rush_attempts': rush_attempts,
+                        'rush_yards': int(rush_yards) if not pd.isna(rush_yards) else 0,
+                        'rush_touchdowns': rush_tds,
+                        'rush_fumbles': 0,  # Would need fumble-specific logic
+                        
+                        # Receiving stats
+                        'receptions': receptions,
+                        'receiving_targets': len(rec_plays),  # All targeted passes
+                        'receiving_yards': int(receiving_yards) if not pd.isna(receiving_yards) else 0,
+                        'receiving_touchdowns': receiving_tds,
+                        'receiving_fumbles': 0,
+                        
+                        # Advanced metrics
+                        'air_yards': int(air_yards) if not pd.isna(air_yards) else 0,
+                        'yards_after_catch': int(yac) if not pd.isna(yac) else 0,
+                        'target_share': None,  # Would need team-level calculation
+                        
+                        # Game context
+                        'is_home': None,  # Would need to determine from team/game info
+                    }
+                    stats_records.append(stat_record)
+        
+        return pd.DataFrame(stats_records)
     
     def setup_default_scoring_system(self):
         """Set up default fantasy scoring systems."""

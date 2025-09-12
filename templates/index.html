@@ -1,0 +1,248 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>NFL Fantasy Predictor - AI-Powered Gameday Intelligence</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/styles.css') }}">
+    <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css" rel="stylesheet">
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+</head>
+<body>
+    <div id="app">
+        <!-- Header -->
+        <header class="header">
+            <div class="container">
+                <div class="header-content">
+                    <div class="logo">
+                        <i class="fas fa-brain"></i>
+                        <h1>NFL Fantasy Predictor</h1>
+                        <span class="tagline">AI-Powered Gameday Intelligence</span>
+                    </div>
+                    <div class="header-stats">
+                        <div class="stat">
+                            <span class="stat-value" id="current-week">Week -</span>
+                            <span class="stat-label">Current</span>
+                        </div>
+                        <div class="stat">
+                            <span class="stat-value" id="injury-count">-</span>
+                            <span class="stat-label">Injuries</span>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </header>
+
+        <!-- Main Content -->
+        <main class="main">
+            <div class="container">
+                
+                <!-- Control Panel -->
+                <section class="control-panel">
+                    <div class="panel-header">
+                        <h2><i class="fas fa-sliders-h"></i> Control Panel</h2>
+                    </div>
+                    <div class="panel-content">
+                        <div class="controls-grid">
+                            <!-- Scoring System -->
+                            <div class="control-group">
+                                <label for="scoring-system">Scoring System</label>
+                                <select id="scoring-system" class="modern-select">
+                                    <option value="">Loading...</option>
+                                </select>
+                            </div>
+
+                            <!-- Week Selection -->
+                            <div class="control-group">
+                                <label for="week-select">Week</label>
+                                <input type="number" id="week-select" min="1" max="18" class="modern-input">
+                            </div>
+
+                            <!-- Season Selection -->
+                            <div class="control-group">
+                                <label for="season-select">Season</label>
+                                <input type="number" id="season-select" min="2020" max="2025" value="2025" class="modern-input">
+                            </div>
+
+                            <!-- Action Buttons -->
+                            <div class="control-group buttons">
+                                <button id="get-predictions" class="btn btn-primary">
+                                    <i class="fas fa-chart-line"></i> Get Predictions
+                                </button>
+                                <div class="injury-button-group">
+                                    <button id="refresh-injuries" class="btn btn-secondary">
+                                        <i class="fas fa-plus-square"></i> Injury Report
+                                    </button>
+                                    <label class="historical-checkbox">
+                                        <input type="checkbox" id="historical-injury-toggle">
+                                        <span class="checkbox-label">Historical</span>
+                                    </label>
+                                </div>
+                                <button id="update-data" class="btn btn-accent">
+                                    <i class="fas fa-sync-alt"></i> Update Data
+                                </button>
+                            </div>
+                        </div>
+                    </div>
+                </section>
+
+                <!-- Status Bar -->
+                <div class="status-bar" id="status-bar" style="display: none;">
+                    <div class="status-content">
+                        <i class="fas fa-spinner fa-spin"></i>
+                        <span id="status-message">Loading...</span>
+                    </div>
+                </div>
+
+                <!-- NFL Schedule -->
+                <section class="schedule-section">
+                    <div class="section-header">
+                        <h2><i class="fas fa-calendar-alt"></i> NFL Schedule</h2>
+                        <div class="section-meta">
+                            <span id="schedule-week">Week 2, 2025</span>
+                        </div>
+                    </div>
+                    <div class="games-grid" id="games-grid">
+                        <!-- Games will be populated here -->
+                    </div>
+                </section>
+
+                <!-- Predictions Dashboard -->
+                <div class="dashboard" id="predictions-dashboard" style="display: none;">
+                    
+                    <!-- Summary Cards -->
+                    <section class="summary-section">
+                        <div class="summary-cards">
+                            <div class="summary-card">
+                                <div class="card-icon">
+                                    <i class="fas fa-users"></i>
+                                </div>
+                                <div class="card-content">
+                                    <h3 id="total-players">0</h3>
+                                    <p>Players Analyzed</p>
+                                </div>
+                            </div>
+                            <div class="summary-card">
+                                <div class="card-icon">
+                                    <i class="fas fa-trophy"></i>
+                                </div>
+                                <div class="card-content">
+                                    <h3 id="optimal-projection">0.0</h3>
+                                    <p>Optimal Lineup</p>
+                                </div>
+                            </div>
+                            <div class="summary-card">
+                                <div class="card-icon">
+                                    <i class="fas fa-plus-square"></i>
+                                </div>
+                                <div class="card-content">
+                                    <h3 id="injuries-out">0</h3>
+                                    <p>Players OUT</p>
+                                </div>
+                            </div>
+                            <div class="summary-card">
+                                <div class="card-icon">
+                                    <i class="fas fa-question-circle"></i>
+                                </div>
+                                <div class="card-content">
+                                    <h3 id="injuries-questionable">0</h3>
+                                    <p>Questionable</p>
+                                </div>
+                            </div>
+                        </div>
+                    </section>
+
+                    <!-- Optimal Lineup -->
+                    <section class="optimal-lineup-section">
+                        <div class="section-header">
+                            <h2><i class="fas fa-star"></i> Optimal Lineup</h2>
+                            <div class="lineup-total">
+                                Total: <span id="lineup-total">0.0</span> pts
+                            </div>
+                        </div>
+                        <div class="lineup-grid" id="optimal-lineup">
+                            <!-- Optimal lineup will be populated here -->
+                        </div>
+                    </section>
+
+                    <!-- Position Rankings -->
+                    <section class="rankings-section">
+                        <div class="section-header">
+                            <h2><i class="fas fa-list-ol"></i> Top Players by Position</h2>
+                        </div>
+                        <div class="positions-tabs">
+                            <button class="tab-btn active" data-position="QB">QB</button>
+                            <button class="tab-btn" data-position="RB">RB</button>
+                            <button class="tab-btn" data-position="WR">WR</button>
+                            <button class="tab-btn" data-position="TE">TE</button>
+                        </div>
+                        <div class="rankings-content" id="rankings-content">
+                            <!-- Rankings will be populated here -->
+                        </div>
+                    </section>
+
+                    <!-- DST Recommendations -->
+                    <section class="dst-section">
+                        <div class="section-header">
+                            <h2><i class="fas fa-shield-alt"></i> DST Recommendations</h2>
+                        </div>
+                        <div class="dst-grid" id="dst-recommendations">
+                            <!-- DST recommendations will be populated here -->
+                        </div>
+                    </section>
+                </div>
+
+                <!-- Injury Report Modal -->
+                <div class="modal" id="injury-modal">
+                    <div class="modal-content">
+                        <div class="modal-header">
+                            <h3><i class="fas fa-plus-square"></i> <span id="injury-modal-title">Injury Report</span></h3>
+                            <button class="modal-close" onclick="closeModal('injury-modal')">
+                                <i class="fas fa-times"></i>
+                            </button>
+                        </div>
+                        <div class="modal-body" id="injury-modal-body">
+                            <!-- Injury report content will be populated here -->
+                        </div>
+                    </div>
+                </div>
+
+            </div>
+        </main>
+
+        <!-- Footer -->
+        <footer class="footer">
+            <div class="container">
+                <div class="footer-content">
+                    <div class="footer-section">
+                        <h4>NFL Fantasy Predictor</h4>
+                        <p>AI-powered fantasy football predictions with real-time injury intelligence</p>
+                    </div>
+                    <div class="footer-section">
+                        <h4>Features</h4>
+                        <ul>
+                            <li>Position-specific matchup analysis</li>
+                            <li>Real-time injury integration</li>
+                            <li>20+ years of historical data</li>
+                            <li>Machine learning predictions</li>
+                        </ul>
+                    </div>
+                    <div class="footer-section">
+                        <h4>System Status</h4>
+                        <div class="system-status">
+                            <span class="status-indicator active"></span>
+                            <span>Operational</span>
+                        </div>
+                        <small>Last updated: <span id="last-updated">-</span></small>
+                    </div>
+                </div>
+                <div class="footer-bottom">
+                    <p>&copy; 2025 NFL Fantasy Predictor. Built with advanced machine learning and real-time data integration.</p>
+                </div>
+            </div>
+        </footer>
+    </div>
+
+    <script src="{{ url_for('static', filename='js/app.js') }}"></script>
+</body>
+</html>
