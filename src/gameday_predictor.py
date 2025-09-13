@@ -44,6 +44,13 @@ class GamedayPredictor:
         self.logger.info(f"Found {len(available_players)} available players")
         
         # Step 3: Generate base predictions
+        # Prepare batched feature cache for this prediction set
+        try:
+            self.predictor.prepare_prediction_cache(
+                [p['player_id'] for p in available_players], week, season, scoring_system
+            )
+        except Exception as e:
+            self.logger.warning(f"Feature cache prep failed (continuing without cache): {e}")
         player_predictions = self._generate_base_predictions(
             available_players, week, season, scoring_system
         )
@@ -206,7 +213,9 @@ class GamedayPredictor:
             self.predictor.train_models(training_seasons, scoring_system)
         
         failed_predictions = 0
-        for player in players:
+        total = max(1, len(players))
+        step = max(1, total // 200)
+        for idx, player in enumerate(players, 1):
             try:
                 predicted_points = self.predictor.predict_player_points(
                     player['player_id'], week, season, scoring_system
@@ -229,6 +238,7 @@ class GamedayPredictor:
                 failed_predictions += 1
                 self.logger.warning(f"Failed to predict for {player['player_name']}: {e}")
                 continue
+            # (Progress reporting removed)
         
         if failed_predictions > 0:
             self.logger.warning(f"{failed_predictions} predictions failed or returned None/zero")

@@ -2,6 +2,7 @@
 """Script to collect NFL data and populate the database."""
 
 import sys
+import os
 import logging
 from pathlib import Path
 
@@ -32,6 +33,8 @@ def main():
     
     try:
         # Load configuration
+        # Ensure a default DB_PATH if not provided externally
+        os.environ.setdefault("DB_PATH", "data/nfl_data.db")
         config = Config.from_env()
         logger.info(f"Collecting data for seasons {config.data_collection.start_season}-{config.data_collection.end_season}")
         

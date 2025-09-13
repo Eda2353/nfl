@@ -106,6 +106,7 @@ class PlayerPredictor:
         self.models = {}  # One model per position
         self.scalers = {}  # One scaler per position
         self.feature_columns = []
+        self._feature_cache = {}
         
     def extract_features(self, player_id: str, target_week: int, target_season: int, 
                         scoring_system: str = 'FanDuel') -> Optional[PredictionFeatures]:
@@ -334,6 +335,69 @@ class PlayerPredictor:
                 position_data[position] = pd.DataFrame()
         
         return position_data
+
+    # ------------------ Batched feature cache for prediction ------------------
+    def prepare_prediction_cache(self, player_ids: List[str], target_week: int, target_season: int,
+                                 scoring_system: str = 'FanDuel',
+                                 meta_cb=None, tick_cb=None) -> None:
+        """Prefetch historical games for many players at once and cache them per-player.
+
+        This reduces per-player SQL round-trips during prediction.
+        """
+        if not player_ids:
+            return
+        uniq_ids = list({pid for pid in player_ids if pid})
+        # Fetch historical games for all players in one pass
+        placeholders = ','.join([f":p{i}" for i in range(len(uniq_ids))])
+        params = {f"p{i}": pid for i, pid in enumerate(uniq_ids)}
+        params.update({'season': target_season, 'week': target_week})
+        with self.db.engine.connect() as conn:
+            from sqlalchemy import text
+            historical = pd.read_sql_query(text(f"""
+                SELECT gs.*, g.week, g.season_id
+                FROM game_stats gs
+                JOIN games g ON gs.game_id = g.game_id
+                WHERE gs.player_id IN ({placeholders})
+                  AND (g.season_id < :season OR (g.season_id = :season AND g.week < :week))
+                ORDER BY gs.player_id, g.season_id DESC, g.week DESC
+            """), conn, params=params)
+
+        # Compute fantasy points once for all rows
+        if not historical.empty:
+            total = len(historical)
+            if meta_cb:
+                try:
+                    meta_cb(total)
+                except Exception:
+                    pass
+            # Process in chunks to provide progress feedback
+            def _fp(row):
+                pts = self.calculator.calculate_player_points(row, scoring_system)
+                return pts.total_points
+            # Preallocate column
+            historical['fantasy_points'] = 0.0
+            chunk = max(200, total // 200)
+            done = 0
+            for start in range(0, total, chunk):
+                end = min(start + chunk, total)
+                chunk_df = historical.iloc[start:end]
+                historical.loc[chunk_df.index, 'fantasy_points'] = chunk_df.apply(_fp, axis=1)
+                done = end
+                if tick_cb:
+                    try:
+                        tick_cb(done, total, f"Preparing features {done}/{total}")
+                    except Exception:
+                        pass
+            # Group per player and cache
+            grouped = historical.groupby('player_id')
+            self._feature_cache = {pid: df for pid, df in grouped}
+        else:
+            if meta_cb:
+                try:
+                    meta_cb(0)
+                except Exception:
+                    pass
+            self._feature_cache = {}
     
     def train_models(self, seasons: List[int], scoring_system: str = 'FanDuel'):
         """Train prediction models for each position."""
@@ -342,6 +406,8 @@ class PlayerPredictor:
         
         # Prepare training data
         position_data = self.prepare_training_data(seasons, scoring_system)
+
+        
         
         self.feature_columns = [
             'avg_fantasy_points_l3', 'avg_targets_l3', 'avg_carries_l3', 
@@ -373,7 +439,8 @@ class PlayerPredictor:
             
             # Train ensemble of models
             models = {
-                'rf': RandomForestRegressor(n_estimators=100, random_state=42),
+                # Use all CPU cores for RandomForest to speed up training
+                'rf': RandomForestRegressor(n_estimators=100, random_state=42, n_jobs=-1),
                 'gb': GradientBoostingRegressor(n_estimators=100, random_state=42),
                 'ridge': Ridge(alpha=1.0)
             }
@@ -429,7 +496,55 @@ class PlayerPredictor:
         if position not in self.models:
             return None
         
-        # Extract features
+        # Extract features (use cache if available)
+        cached_df = self._feature_cache.get(player_id)
+        if cached_df is not None and len(cached_df) >= 3:
+            # Build features from cached historical rows
+            historical_games = cached_df
+            recent_3 = historical_games.head(3)
+            avg_fp_l3 = recent_3['fantasy_points'].mean()
+            avg_targets_l3 = recent_3['receiving_targets'].mean()
+            avg_carries_l3 = recent_3['rush_attempts'].mean()
+            avg_pass_att_l3 = recent_3['pass_attempts'].mean()
+            target_share_l3 = (recent_3['target_share'].mean()
+                               if 'target_share' in recent_3 and not recent_3['target_share'].isna().all() else 0)
+            current_season_games = historical_games[historical_games['season_id'] == season]
+            avg_fp_season = current_season_games['fantasy_points'].mean() if not current_season_games.empty else 0
+            games_played_season = len(current_season_games)
+            # Position encoding
+            with self.db.engine.connect() as conn:
+                from sqlalchemy import text
+                pos_df = pd.read_sql_query(text("SELECT position FROM players WHERE player_id = :pid"), conn, params={'pid': player_id})
+            position = pos_df.iloc[0]['position'] if not pos_df.empty else 'UNK'
+            position_map = {'QB': 0, 'RB': 1, 'WR': 2, 'TE': 3}
+            pos_enc = position_map.get(position, 4)
+            # Consistency/trend
+            recent_5 = historical_games.head(5)
+            consistency = recent_5['fantasy_points'].std() if len(recent_5) >= 3 else 0
+            trend = 0
+            if len(recent_5) >= 4:
+                x = np.arange(len(recent_5))
+                y = recent_5['fantasy_points'].values
+                trend = np.polyfit(x, y, 1)[0]
+            base_features = [
+                avg_fp_l3, avg_targets_l3, avg_carries_l3, avg_pass_att_l3,
+                avg_fp_season, games_played_season, pos_enc, target_share_l3,
+                consistency, trend
+            ]
+            feature_names = [
+                'avg_fantasy_points_l3', 'avg_targets_l3', 'avg_carries_l3', 
+                'avg_passing_attempts_l3', 'avg_fantasy_points_season', 'games_played_season',
+                'position_encoded', 'target_share_l3', 'consistency_score', 'trend_score'
+            ]
+            X = pd.DataFrame([base_features], columns=feature_names)
+            if isinstance(self.models[position], Ridge):
+                X = self.scalers[position].transform(X)
+            else:
+                X = X.values
+            pred = self.models[position].predict(X)[0]
+            return float(max(0, pred))
+        
+        # Fallback to on-demand extraction
         features = self.extract_features(player_id, week, season, scoring_system)
         if features is None:
             return None
@@ -755,7 +870,8 @@ class PlayerPredictor:
         
         # Train models
         models = {
-            'rf': RandomForestRegressor(n_estimators=100, random_state=42),
+            # Use all CPU cores for RandomForest to speed up training
+            'rf': RandomForestRegressor(n_estimators=100, random_state=42, n_jobs=-1),
             'gb': GradientBoostingRegressor(n_estimators=100, random_state=42),
             'ridge': Ridge(alpha=1.0)
         }

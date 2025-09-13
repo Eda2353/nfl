@@ -188,24 +188,16 @@ class NFLFantasyApp {
     }
 
     async getPredictions() {
-        this.showStatus('Generating predictions...', 'loading');
-        
+        this.showStatus('Generating predictions (this may take up to 20 minutes)...', 'loading');
         try {
             const response = await fetch(`/api/predictions/${this.currentSeason}/${this.currentWeek}/${this.currentScoring}`);
             const data = await response.json();
-            
             if (response.ok) {
                 this.displayPredictions(data);
                 this.hideStatus();
-                
                 // Show dashboard
                 document.getElementById('predictions-dashboard').style.display = 'block';
-                
-                // Scroll to dashboard
-                document.getElementById('predictions-dashboard').scrollIntoView({ 
-                    behavior: 'smooth',
-                    block: 'start'
-                });
+                document.getElementById('predictions-dashboard').scrollIntoView({ behavior: 'smooth', block: 'start' });
             } else {
                 throw new Error(data.error || 'Failed to generate predictions');
             }
@@ -433,13 +425,20 @@ class NFLFantasyApp {
             const response = await fetch('/api/update-data', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ seasons: [2024, 2025] })
+                body: JSON.stringify({ seasons: [2024, 2025], update_schedules: true, update_injuries: true, update_dst: true })
             });
             
             const data = await response.json();
             
             if (response.ok) {
-                this.showStatus('Data update started in background...', 'success');
+                const inc = data.includes || {};
+                const items = [];
+                if (inc.schedules) items.push('schedules');
+                if (inc.injuries) items.push('injuries');
+                if (inc.dst_stats) items.push('DST stats');
+                const seasons = (inc.seasons || []).join(', ');
+                const detail = items.length ? `Updating ${items.join(', ')}${seasons ? ` for seasons ${seasons}` : ''}...` : 'Data update started in background...';
+                this.showStatus(detail, 'success');
                 setTimeout(() => this.hideStatus(), 3000);
             } else {
                 throw new Error(data.error || 'Failed to update data');

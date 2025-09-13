@@ -2,6 +2,7 @@
 """Script to add FanDuel and DraftKings scoring systems to the database."""
 
 import sys
+import os
 import logging
 from pathlib import Path
 
@@ -22,7 +23,8 @@ def add_dfs_scoring_systems():
     """Add FanDuel and DraftKings scoring systems."""
     logger = logging.getLogger(__name__)
     
-    # Load configuration
+    # Load configuration (ensure default DB path if missing)
+    os.environ.setdefault("DB_PATH", "data/nfl_data.db")
     config = Config.from_env()
     
     # Initialize database

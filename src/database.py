@@ -136,3 +136,35 @@ class DatabaseManager:
             return df['game_id'].tolist()
         except:
             return []
+
+    def rebuild_indexes(self):
+        """Recreate important indexes (idempotent). Useful after bulk loads that replaced tables.
+
+        Runs CREATE INDEX IF NOT EXISTS for the known indexes defined in the schema.
+        """
+        index_statements = [
+            # Games-related lookups
+            "CREATE INDEX IF NOT EXISTS idx_game_stats_game_date ON games(game_date)",
+            "CREATE INDEX IF NOT EXISTS idx_game_stats_season_week ON games(season_id, week)",
+            # Player/game stats
+            "CREATE INDEX IF NOT EXISTS idx_game_stats_player_season ON game_stats(player_id, game_id)",
+            "CREATE INDEX IF NOT EXISTS idx_fantasy_points_lookup ON fantasy_points(player_id, system_id)",
+            "CREATE INDEX IF NOT EXISTS idx_player_teams_season ON player_teams(player_id, season_id)",
+            # Team defense
+            "CREATE INDEX IF NOT EXISTS idx_team_defense_season_week ON team_defense_stats(team_id, season_id, week)",
+            # Injuries
+            "CREATE INDEX IF NOT EXISTS idx_historical_injuries_lookup ON historical_injuries(season, week, team)",
+            "CREATE INDEX IF NOT EXISTS idx_historical_injuries_player ON historical_injuries(gsis_id, season)",
+            "CREATE INDEX IF NOT EXISTS idx_historical_injuries_status ON historical_injuries(report_status)"
+        ]
+
+        with self.engine.connect() as conn:
+            for stmt in index_statements:
+                try:
+                    conn.execute(text(stmt))
+                except Exception as e:
+                    logger.warning(f"Index statement failed/skipped: {e} :: {stmt}")
+            try:
+                conn.commit()
+            except Exception:
+                pass

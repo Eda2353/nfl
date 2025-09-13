@@ -14,16 +14,21 @@ from src.database import DatabaseManager
 from src.gameday_predictor import GamedayPredictor
 from src.collectors.injury_collector import InjuryCollector
 from src.collectors.nfl_data_collector import NFLDataCollector
+from src.collectors.dst_collector import DSTCollector
 from datetime import datetime, timedelta
 from sqlalchemy import text
 import threading
 import logging
+from pathlib import Path
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 
 app = Flask(__name__)
 app.config['SECRET_KEY'] = 'nfl-fantasy-predictions-2025'
+
+# Default DB target: prefer data/nfl_data.db unless overridden by environment
+os.environ.setdefault('DB_PATH', 'data/nfl_data.db')
 
 # Global instances
 config = Config.from_env()
@@ -36,6 +41,32 @@ data_collector = NFLDataCollector(config, db_manager)
 prediction_cache = {}
 injury_cache = {}
 schedule_cache = {}
+
+## (Removed background progress job machinery)
+
+# Model persistence helpers
+def _model_dir() -> Path:
+    return Path(os.getenv('MODEL_DIR', 'data'))
+
+def _model_path_for_scoring(scoring_system: str) -> Path:
+    # Simple convention: data/models_{SCORING}.pkl (spaces replaced by underscores)
+    sanitized = scoring_system.replace(' ', '_')
+    base = os.getenv('MODEL_BASENAME', f'models_{sanitized}.pkl')
+    return _model_dir() / base
+
+def _try_load_models(scoring_system: str) -> bool:
+    try:
+        path = _model_path_for_scoring(scoring_system)
+        if path.exists():
+            app.logger.info(f"Loading saved models for {scoring_system} from {path}")
+            gameday_predictor.predictor.load_models(str(path))
+            return True
+        else:
+            app.logger.info(f"No saved model found for {scoring_system} at {path}")
+            return False
+    except Exception as e:
+        app.logger.warning(f"Failed to load saved models for {scoring_system}: {e}")
+        return False
 
 @app.route('/api/health')
 def health():
@@ -207,12 +238,14 @@ def get_schedule(season, week):
         with db_manager.engine.connect() as conn:
             games = conn.execute(text("""
                 SELECT g.game_id, g.game_date, g.game_time,
-                       ht.team_name as home_team, ht.team_id as home_team_id,
-                       at.team_name as away_team, at.team_id as away_team_id,
+                       COALESCE(ht.team_name, g.home_team_id) as home_team, 
+                       g.home_team_id as home_team_id,
+                       COALESCE(at.team_name, g.away_team_id) as away_team, 
+                       g.away_team_id as away_team_id,
                        g.home_score, g.away_score
                 FROM games g
-                JOIN teams ht ON g.home_team_id = ht.team_id
-                JOIN teams at ON g.away_team_id = at.team_id
+                LEFT JOIN teams ht ON g.home_team_id = ht.team_id
+                LEFT JOIN teams at ON g.away_team_id = at.team_id
                 WHERE g.season_id = :season AND g.week = :week
                 ORDER BY g.game_date, g.game_time
             """), {'season': season, 'week': week}).fetchall()
@@ -401,8 +434,11 @@ def get_predictions(season, week, scoring_system):
             return jsonify(cached_data)
     
     try:
-        # Train models if needed
+        # Train models if needed (attempt to load saved models first)
         app.logger.info(f"Generating predictions for Week {week}, {season} - {scoring_system}")
+
+        if not getattr(gameday_predictor.predictor, 'models', None):
+            _try_load_models(scoring_system)
         
         # Get gameday predictions
         gameday_data = gameday_predictor.get_gameday_predictions(
@@ -467,6 +503,8 @@ def get_predictions(season, week, scoring_system):
         app.logger.error(f"Full traceback:\n{traceback.format_exc()}")
         return jsonify({'error': str(e)}), 500
 
+## (Removed async prediction start/progress/result endpoints)
+
 @app.route('/api/update-data', methods=['POST'])
 def update_data():
     """Update database with latest NFL data, injury reports, and schedules."""
@@ -475,6 +513,7 @@ def update_data():
         seasons = data.get('seasons', [2024, 2025])
         update_injuries = data.get('update_injuries', True)
         update_schedules = data.get('update_schedules', True)
+        update_dst = data.get('update_dst', True)
         
         def update_in_background():
             try:
@@ -520,6 +559,16 @@ def update_data():
                         except Exception as season_error:
                             app.logger.warning(f"Failed to update season {season}: {season_error}")
                             continue
+
+                # Update team defense/special teams stats (DST)
+                if update_dst:
+                    app.logger.info("Collecting team defense (DST) statistics...")
+                    try:
+                        dst_collector = DSTCollector(db_manager)
+                        dst_collector.collect_team_defense_stats(seasons)
+                        app.logger.info("DST statistics collection complete")
+                    except Exception as dst_error:
+                        app.logger.warning(f"DST stats update failed: {dst_error}")
                 
                 # Update injury reports
                 if update_injuries:
@@ -537,6 +586,14 @@ def update_data():
                     except Exception as injury_error:
                         app.logger.warning(f"Injury update partially failed: {injury_error}")
                 
+                # Rebuild indexes after bulk data operations
+                try:
+                    app.logger.info("Rebuilding database indexes for performance...")
+                    db_manager.rebuild_indexes()
+                    app.logger.info("Index rebuild complete")
+                except Exception as e:
+                    app.logger.warning(f"Index rebuild skipped/failed: {e}")
+
                 app.logger.info("Comprehensive data update completed successfully")
                 
                 # Clear all relevant caches to force fresh data
@@ -558,6 +615,7 @@ def update_data():
             'includes': {
                 'schedules': update_schedules,
                 'injuries': update_injuries,
+                'dst_stats': update_dst,
                 'seasons': seasons
             }
         })
@@ -579,6 +637,14 @@ def train_models():
                 app.logger.info(f"Training models for {scoring_system} using seasons: {seasons}")
                 gameday_predictor.predictor.train_models(seasons, scoring_system)
                 app.logger.info("Model training completed successfully")
+                # Persist trained models
+                try:
+                    _model_dir().mkdir(parents=True, exist_ok=True)
+                    model_path = _model_path_for_scoring(scoring_system)
+                    gameday_predictor.predictor.save_models(str(model_path))
+                    app.logger.info(f"Saved models for {scoring_system} to {model_path}")
+                except Exception as save_err:
+                    app.logger.warning(f"Could not save models for {scoring_system}: {save_err}")
                 
                 # Clear prediction cache
                 prediction_cache.clear()
@@ -601,6 +667,11 @@ if __name__ == '__main__':
     # Initialize models on startup
     try:
         app.logger.info("Initializing NFL Fantasy Prediction System...")
+        # Attempt to load saved models for default scoring system (FanDuel)
+        try:
+            _try_load_models('FanDuel')
+        except Exception:
+            pass
         # Could pre-train models here if needed
         app.logger.info("System initialized successfully")
     except Exception as e:
