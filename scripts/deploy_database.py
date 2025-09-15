@@ -77,16 +77,24 @@ def deploy_database():
     )
     if not success:
         logger.warning("Playoff games may not be included")
-    
-    # Step 3: Collect detailed kicking data
+
+    # Step 3: Normalize synthetic game IDs to official schedule IDs
+    success = run_command(
+        "python3 scripts/normalize_game_ids.py --start 2020 --end 2025",
+        "Normalizing synthetic game IDs to official IDs"
+    )
+    if not success:
+        logger.warning("Game ID normalization failed; training joins may be affected")
+
+    # Step 4: Collect detailed kicking data
     success = run_command(
         "python3 scripts/collect_kicking_for_deploy.py",
         "Collecting comprehensive kicking data with distances"
     )
     if not success:
         logger.warning("Kicker scoring may not work properly")
-    
-    # Step 4: Collect team defense (DST) stats for matchup/DST modeling
+
+    # Step 5: Collect team defense (DST) stats for matchup/DST modeling
     success = run_command(
         "python3 scripts/collect_team_defense_stats.py --start 2020 --end 2025",
         "Collecting team defense (DST) stats"
@@ -94,7 +102,7 @@ def deploy_database():
     if not success:
         logger.warning("DST stats may be missing; DST predictions/matchups limited")
 
-    # Step 5: Import historical injury reports (2020+)
+    # Step 6: Import historical injury reports (2020+)
     success = run_command(
         "python3 scripts/collect_historical_injuries.py --start 2020 --end 2025",
         "Importing historical injury reports"
@@ -102,7 +110,7 @@ def deploy_database():
     if not success:
         logger.warning("Historical injuries may be missing; historical injury views limited")
 
-    # Step 6: Add duplicate constraints for data integrity
+    # Step 7: Add duplicate constraints for data integrity
     success = run_command(
         "python3 scripts/add_duplicate_constraints.py",
         "Adding duplicate prevention constraints"
@@ -110,7 +118,7 @@ def deploy_database():
     if not success:
         logger.warning("Duplicate prevention may not be optimal")
     
-    # Step 7: Ensure scoring systems exist (schema-aware)
+    # Step 8: Ensure scoring systems exist (schema-aware)
     success = run_command(
         "python3 scripts/add_scoring_systems.py",
         "Ensuring scoring systems are configured"

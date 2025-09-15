@@ -140,7 +140,8 @@ class PlayerPredictor:
                 'week': target_week
             })
         
-        if len(historical_games) < 3:  # Need at least 3 games of history
+        # Early-season fallback: allow minimal history to enable predictions in weeks 1-3
+        if len(historical_games) < 1:
             return None
         
         # Calculate fantasy points for each historical game
@@ -260,7 +261,7 @@ class PlayerPredictor:
         
         return position_feature_maps.get(position, [])
     
-    def prepare_training_data(self, seasons: List[int], scoring_system: str = 'FanDuel') -> Dict[str, pd.DataFrame]:
+    def prepare_training_data(self, seasons: List[int], scoring_system: str = 'FanDuel', cutoff: Optional[Tuple[int, int]] = None) -> Dict[str, pd.DataFrame]:
         """Prepare training data for all positions."""
         
         position_data = {'QB': [], 'RB': [], 'WR': [], 'TE': []}
@@ -269,6 +270,12 @@ class PlayerPredictor:
         seasons_str = ','.join(map(str, seasons))
         with self.db.engine.connect() as conn:
             from sqlalchemy import text
+            extra_cut = ""
+            params = {}
+            if cutoff:
+                c_season, c_week = cutoff
+                extra_cut = " AND (g.season_id < :c_season OR (g.season_id = :c_season AND g.week < :c_week))"
+                params.update({'c_season': c_season, 'c_week': c_week})
             all_games = pd.read_sql_query(text(f"""
                 SELECT gs.player_id, p.player_name, p.position, g.season_id, g.week,
                        gs.pass_yards, gs.pass_touchdowns, gs.pass_interceptions,
@@ -278,10 +285,10 @@ class PlayerPredictor:
                 FROM game_stats gs
                 JOIN games g ON gs.game_id = g.game_id
                 JOIN players p ON gs.player_id = p.player_id
-                WHERE g.season_id IN ({seasons_str})
+                WHERE g.season_id IN ({seasons_str}) {extra_cut}
                   AND p.position IN ('QB', 'RB', 'WR', 'TE')
                 ORDER BY gs.player_id, g.season_id, g.week
-            """), conn)
+            """), conn, params=params)
         
         print(f"Processing {len(all_games)} games for training data...")
         
@@ -292,8 +299,8 @@ class PlayerPredictor:
             week = game['week']
             season = game['season_id']
             
-            # Skip week 1 (no historical data)
-            if week <= 2:
+            # Previously skipped early weeks to ensure history; allow from week 2 onward
+            if week <= 1:
                 continue
                 
             # Extract features for predicting this game
@@ -399,13 +406,13 @@ class PlayerPredictor:
                     pass
             self._feature_cache = {}
     
-    def train_models(self, seasons: List[int], scoring_system: str = 'FanDuel'):
+    def train_models(self, seasons: List[int], scoring_system: str = 'FanDuel', cutoff: Optional[Tuple[int, int]] = None):
         """Train prediction models for each position."""
         
         print(f"Training models for seasons: {seasons}")
         
         # Prepare training data
-        position_data = self.prepare_training_data(seasons, scoring_system)
+        position_data = self.prepare_training_data(seasons, scoring_system, cutoff=cutoff)
 
         
         
@@ -418,7 +425,7 @@ class PlayerPredictor:
         for position in ['QB', 'RB', 'WR', 'TE']:
             data = position_data[position]
             
-            if len(data) < 50:  # Need minimum data
+            if len(data) < 25:  # Reduced minimum data to support early-season training
                 print(f"Insufficient data for {position}: {len(data)} examples")
                 continue
             
@@ -475,7 +482,7 @@ class PlayerPredictor:
         # Train DST model
         print("\n" + "="*50)
         print("Training DST model...")
-        self.train_dst_model(seasons, scoring_system)
+        self.train_dst_model(seasons, scoring_system, cutoff=cutoff)
     
     def predict_player_points(self, player_id: str, week: int, season: int, 
                              scoring_system: str = 'FanDuel') -> Optional[float]:
@@ -771,7 +778,7 @@ class PlayerPredictor:
         
         return features
     
-    def train_dst_model(self, seasons: List[int], scoring_system: str = 'FanDuel'):
+    def train_dst_model(self, seasons: List[int], scoring_system: str = 'FanDuel', cutoff: Optional[Tuple[int, int]] = None):
         """Train prediction model for DST."""
         
         print(f"Training DST model for seasons: {seasons}")
@@ -783,15 +790,21 @@ class PlayerPredictor:
         seasons_str = ','.join(map(str, seasons))
         with self.db.engine.connect() as conn:
             from sqlalchemy import text
+            extra_cut = ""
+            params = {}
+            if cutoff:
+                c_season, c_week = cutoff
+                extra_cut = " AND (season_id < :c_season OR (season_id = :c_season AND week < :c_week))"
+                params.update({'c_season': c_season, 'c_week': c_week})
             all_dst_games = pd.read_sql_query(text(f"""
                 SELECT team_id, game_id, season_id, week,
                        points_allowed, sacks, interceptions, fumbles_recovered,
                        defensive_touchdowns, pick_six, fumble_touchdowns, 
                        return_touchdowns, safeties
                 FROM team_defense_stats
-                WHERE season_id IN ({seasons_str})
+                WHERE season_id IN ({seasons_str}) {extra_cut}
                 ORDER BY team_id, season_id, week
-            """), conn)
+            """), conn, params=params)
         
         print(f"Processing {len(all_dst_games)} DST games for training data...")
         

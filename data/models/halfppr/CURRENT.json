@@ -1,0 +1,53 @@
+{
+  "file": "halfppr_2025_wk2.pkl",
+  "metadata": {
+    "scoring": "Half PPR",
+    "seasons_used": [
+      2022,
+      2023,
+      2024,
+      2025
+    ],
+    "last_data_season": 2025,
+    "last_data_week": 2,
+    "trained_at_utc": "2025-09-13T21:45:36.431489Z",
+    "app_secret": "nfl-fantasy-predictions-2025",
+    "python_version": "3.11.5",
+    "sklearn_version": "1.3.1",
+    "numpy_version": "1.26.2",
+    "features": {
+      "feature_columns": [
+        "avg_fantasy_points_l3",
+        "avg_targets_l3",
+        "avg_carries_l3",
+        "avg_passing_attempts_l3",
+        "avg_fantasy_points_season",
+        "games_played_season",
+        "position_encoded",
+        "target_share_l3",
+        "consistency_score",
+        "trend_score"
+      ],
+      "dst_feature_columns": [
+        "avg_points_allowed_l3",
+        "avg_sacks_l3",
+        "avg_turnovers_l3",
+        "avg_fantasy_points_l3",
+        "avg_points_allowed_season",
+        "avg_sacks_season",
+        "avg_turnovers_season",
+        "avg_fantasy_points_season",
+        "games_played_season",
+        "opponent_avg_points_l3",
+        "opponent_avg_points_season",
+        "is_home",
+        "consistency_score",
+        "trend_score",
+        "opponent_offensive_score",
+        "matchup_points_modifier",
+        "matchup_sack_modifier"
+      ],
+      "supports_position_features": false
+    }
+  }
+}

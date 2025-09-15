@@ -15,14 +15,29 @@ from src.gameday_predictor import GamedayPredictor
 from src.collectors.injury_collector import InjuryCollector
 from src.collectors.nfl_data_collector import NFLDataCollector
 from src.collectors.dst_collector import DSTCollector
+from src.normalization import normalize_game_ids
 from datetime import datetime, timedelta
 from sqlalchemy import text
 import threading
 import logging
 from pathlib import Path
+import json
+import platform
+import warnings
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
+# Suppress verbose INFO logs from the injury collector module
+logging.getLogger('src.collectors.injury_collector').setLevel(logging.WARNING)
+logging.getLogger('collectors.injury_collector').setLevel(logging.WARNING)
+
+# Suppress scikit-learn feature-name UserWarning during predictions
+warnings.filterwarnings(
+    "ignore",
+    message=r"X does not have valid feature names, but .* was fitted with feature names",
+    category=UserWarning,
+    module=r"sklearn\..*"
+)
 
 app = Flask(__name__)
 app.config['SECRET_KEY'] = 'nfl-fantasy-predictions-2025'
@@ -44,29 +59,309 @@ schedule_cache = {}
 
 ## (Removed background progress job machinery)
 
+############################
 # Model persistence helpers
-def _model_dir() -> Path:
-    return Path(os.getenv('MODEL_DIR', 'data'))
+############################
 
-def _model_path_for_scoring(scoring_system: str) -> Path:
-    # Simple convention: data/models_{SCORING}.pkl (spaces replaced by underscores)
+def _models_base_dir() -> Path:
+    """Base directory for all trained models."""
+    return Path(os.getenv('MODEL_DIR', 'data/models'))
+
+def _safe_scoring(scoring_system: str) -> str:
+    return scoring_system.lower().replace(' ', '')
+
+def _scoring_dir(scoring_system: str) -> Path:
+    return _models_base_dir() / _safe_scoring(scoring_system)
+
+def _legacy_model_path_for_scoring(scoring_system: str) -> Path:
+    """Legacy flat file location used previously (for backward compatibility)."""
     sanitized = scoring_system.replace(' ', '_')
     base = os.getenv('MODEL_BASENAME', f'models_{sanitized}.pkl')
-    return _model_dir() / base
+    return Path(os.getenv('LEGACY_MODEL_DIR', 'data')) / base
+
+def _latest_completed_game(seasons: list[int] | None = None) -> tuple[int, int] | None:
+    """Return (season, week) of the latest fully completed game in DB, optionally limited to seasons list."""
+    try:
+        with db_manager.engine.connect() as conn:
+            if seasons:
+                placeholders = ','.join(str(s) for s in seasons)
+                q = text(f"""
+                    SELECT season_id, MAX(week) AS w
+                    FROM games
+                    WHERE season_id IN ({placeholders}) AND home_score IS NOT NULL AND away_score IS NOT NULL
+                    GROUP BY season_id
+                    ORDER BY season_id DESC
+                """)
+                rows = conn.execute(q).fetchall()
+                if rows:
+                    # Take the most recent season's max week
+                    season, week = rows[0]
+                    return int(season), int(week)
+            # Fallback: any season
+            row = conn.execute(text("""
+                SELECT season_id, week
+                FROM games
+                WHERE home_score IS NOT NULL AND away_score IS NOT NULL
+                ORDER BY season_id DESC, week DESC
+                LIMIT 1
+            """)).fetchone()
+            if row:
+                return int(row[0]), int(row[1])
+    except Exception as e:
+        app.logger.warning(f"Latest completed game lookup failed: {e}")
+    return None
+
+def _week_ready(season: int, week: int) -> dict:
+    """Check if a given (season, week) is fully ingested and ready for training.
+    Criteria: all games have scores, team_defense_stats has two rows per game,
+    and no synthetic game_ids remain for that week.
+    """
+    out = {'season': season, 'week': week, 'ready': False, 'games': 0, 'scored_games': 0,
+           'dst_rows': 0, 'synthetic_ids': 0}
+    try:
+        with db_manager.engine.connect() as conn:
+            total = conn.execute(text("""
+                SELECT COUNT(*) FROM games WHERE season_id=:s AND week=:w
+            """), {'s': season, 'w': week}).fetchone()[0]
+            scored = conn.execute(text("""
+                SELECT COUNT(*) FROM games WHERE season_id=:s AND week=:w AND home_score IS NOT NULL AND away_score IS NOT NULL
+            """), {'s': season, 'w': week}).fetchone()[0]
+            dst = conn.execute(text("""
+                SELECT COUNT(*) FROM team_defense_stats WHERE season_id=:s AND week=:w
+            """), {'s': season, 'w': week}).fetchone()[0]
+            synth = conn.execute(text("""
+                SELECT COUNT(*)
+                FROM game_stats gs
+                JOIN games g ON gs.game_id = g.game_id
+                WHERE g.season_id=:s AND g.week=:w AND (gs.game_id LIKE '%/_vs_%' ESCAPE '/' OR gs.game_id LIKE '%_vs_%')
+            """), {'s': season, 'w': week}).fetchone()[0]
+            out.update({'games': total, 'scored_games': scored, 'dst_rows': dst, 'synthetic_ids': synth})
+            if total > 0 and scored == total and dst == total * 2 and synth == 0:
+                out['ready'] = True
+    except Exception as e:
+        app.logger.warning(f"Week readiness check failed for {season} W{week}: {e}")
+    return out
+
+def _latest_ready_before(season: int, week: int) -> tuple[int, int] | None:
+    for w in range(week - 1, 0, -1):
+        st = _week_ready(season, w)
+        if st.get('ready'):
+            return (season, w)
+    # look back prior seasons if needed
+    for s in range(season - 1, season - 5, -1):
+        if s < 2000:
+            break
+        for w in range(18, 0, -1):
+            st = _week_ready(s, w)
+            if st.get('ready'):
+                return (s, w)
+    return None
+
+def _cutoff_model_path(scoring: str, season: int, week: int) -> Path:
+    sdir = _scoring_dir(scoring)
+    return sdir / f"{_safe_scoring(scoring)}_{season}_wk{week}.pkl"
+
+def _save_cutoff_model(scoring: str, season: int, week: int, trained_through: tuple[int, int] | None, seasons_used: list[int]):
+    try:
+        sdir = _scoring_dir(scoring)
+        sdir.mkdir(parents=True, exist_ok=True)
+        path = _cutoff_model_path(scoring, season, week)
+        gameday_predictor.predictor.save_models(str(path))
+        meta = {
+            'scoring': scoring,
+            'target_season': season,
+            'target_week': week,
+            'trained_through': {'season': trained_through[0], 'week': trained_through[1]} if trained_through else None,
+            'seasons_used': seasons_used,
+            'trained_at_utc': datetime.utcnow().isoformat() + 'Z'
+        }
+        side = path.with_suffix('.json')
+        _write_atomic(side, json.dumps(meta, indent=2).encode('utf-8'))
+        app.logger.info(f"Saved cutoff model for {scoring} at {path}")
+    except Exception as e:
+        app.logger.warning(f"Failed to save cutoff model for {scoring}: {e}")
+
+def _ensure_cutoff_model_for_request(scoring: str, season: int, week: int):
+    path = _cutoff_model_path(scoring, season, week)
+    if path.exists():
+        app.logger.info(f"Loading cutoff model: {path}")
+        gameday_predictor.predictor.load_models(str(path))
+        return
+    # Train cutoff model now
+    seasons = gameday_predictor._get_training_seasons(season)
+    trained_through = _latest_ready_before(season, week)
+    app.logger.info(f"Training cutoff model for {scoring} up to before {season} W{week} (trained_through={trained_through})")
+    gameday_predictor.predictor.train_models(seasons, scoring, cutoff=(season, week))
+    _save_cutoff_model(scoring, season, week, trained_through, seasons)
+
+def _write_atomic(path: Path, data: bytes):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + '.tmp')
+    with open(tmp, 'wb') as f:
+        f.write(data)
+    tmp.replace(path)
+
+def _save_current_model(scoring_system: str, seasons: list[int]):
+    """Persist trained models with versioned name and update CURRENT pointer."""
+    try:
+        latest = _latest_completed_game(seasons) or _latest_completed_game(None) or (seasons[-1], 1)
+        last_season, last_week = latest
+        tag = f"{last_season}_wk{last_week}"
+        sdir = _scoring_dir(scoring_system)
+        sdir.mkdir(parents=True, exist_ok=True)
+        fname = f"{_safe_scoring(scoring_system)}_{tag}.pkl"
+        model_path = sdir / fname
+        # Save pickle
+        gameday_predictor.predictor.save_models(str(model_path))
+        # Metadata
+        meta = {
+            'scoring': scoring_system,
+            'seasons_used': seasons,
+            'last_data_season': last_season,
+            'last_data_week': last_week,
+            'trained_at_utc': datetime.utcnow().isoformat() + 'Z',
+            'app_secret': app.config.get('SECRET_KEY', ''),  # simple app build marker
+            'python_version': platform.python_version(),
+        }
+        try:
+            import sklearn, numpy
+            meta['sklearn_version'] = getattr(sklearn, '__version__', None)
+            meta['numpy_version'] = getattr(numpy, '__version__', None)
+        except Exception:
+            pass
+        # Try to capture feature metadata if available
+        pred = gameday_predictor.predictor
+        meta['features'] = {
+            'feature_columns': getattr(pred, 'feature_columns', []),
+            'dst_feature_columns': getattr(pred, 'dst_feature_columns', []),
+            'supports_position_features': getattr(pred, 'supports_position_features', False)
+        }
+        # Write sidecar and CURRENT pointer
+        sidecar = model_path.with_suffix('.json')
+        _write_atomic(sidecar, json.dumps(meta, indent=2).encode('utf-8'))
+        current = sdir / 'CURRENT.json'
+        current_obj = {'file': fname, 'metadata': meta}
+        _write_atomic(current, json.dumps(current_obj, indent=2).encode('utf-8'))
+        app.logger.info(f"Saved models for {scoring_system} to {model_path}")
+    except Exception as e:
+        app.logger.warning(f"Could not save models for {scoring_system}: {e}")
 
 def _try_load_models(scoring_system: str) -> bool:
+    """Load models for a scoring system from new layout or legacy fallback."""
     try:
-        path = _model_path_for_scoring(scoring_system)
-        if path.exists():
-            app.logger.info(f"Loading saved models for {scoring_system} from {path}")
-            gameday_predictor.predictor.load_models(str(path))
+        sdir = _scoring_dir(scoring_system)
+        current = sdir / 'CURRENT.json'
+        if current.exists():
+            try:
+                data = json.loads(current.read_text())
+                fname = data.get('file')
+                if fname:
+                    path = sdir / fname
+                    if path.exists():
+                        app.logger.info(f"Loading saved models for {scoring_system} from {path}")
+                        gameday_predictor.predictor.load_models(str(path))
+                        return True
+            except Exception as e:
+                app.logger.warning(f"CURRENT.json read error for {scoring_system}: {e}")
+        # Fallback: pick latest pkl in sdir
+        if sdir.exists():
+            pkls = sorted(sdir.glob('*.pkl'))
+            if pkls:
+                path = pkls[-1]
+                app.logger.info(f"Loading saved models for {scoring_system} from {path}")
+                gameday_predictor.predictor.load_models(str(path))
+                return True
+        # Legacy fallback
+        legacy = _legacy_model_path_for_scoring(scoring_system)
+        if legacy.exists():
+            app.logger.info(f"Loading legacy models for {scoring_system} from {legacy}")
+            gameday_predictor.predictor.load_models(str(legacy))
             return True
-        else:
-            app.logger.info(f"No saved model found for {scoring_system} at {path}")
-            return False
+        app.logger.info(f"No saved model found for {scoring_system}")
+        return False
     except Exception as e:
         app.logger.warning(f"Failed to load saved models for {scoring_system}: {e}")
         return False
+
+def _current_model_info(scoring_system: str) -> dict | None:
+    """Read CURRENT.json for a scoring system if present."""
+    try:
+        sdir = _scoring_dir(scoring_system)
+        current = sdir / 'CURRENT.json'
+        if current.exists():
+            return json.loads(current.read_text())
+    except Exception as e:
+        app.logger.warning(f"Model info read failed for {scoring_system}: {e}")
+    return None
+
+def _db_latest_completed_tuple() -> tuple[int, int] | None:
+    latest = _latest_completed_game(None)
+    return latest
+
+def _all_scoring_systems() -> list[str]:
+    try:
+        with db_manager.engine.connect() as conn:
+            rows = conn.execute(text("SELECT system_name FROM scoring_systems ORDER BY system_name"))
+            return [r[0] for r in rows]
+    except Exception:
+        return []
+
+def _model_status_for_scoring(scoring: str) -> dict:
+    """Return status dict including staleness vs DB latest."""
+    info = _current_model_info(scoring)
+    db_latest = _db_latest_completed_tuple()
+    status = {
+        'scoring': scoring,
+        'model': None,
+        'db_latest': {'season': db_latest[0], 'week': db_latest[1]} if db_latest else None,
+        'stale': True,  # default stale when unknown
+    }
+    if info and isinstance(info, dict):
+        meta = info.get('metadata') or {}
+        status['model'] = {
+            'file': info.get('file'),
+            'last_data_season': meta.get('last_data_season'),
+            'last_data_week': meta.get('last_data_week'),
+            'trained_at_utc': meta.get('trained_at_utc'),
+            'seasons_used': meta.get('seasons_used')
+        }
+        if db_latest and meta.get('last_data_season') is not None:
+            m_tuple = (int(meta.get('last_data_season')), int(meta.get('last_data_week') or 0))
+            status['stale'] = m_tuple < db_latest
+        else:
+            status['stale'] = True
+    else:
+        status['model'] = None
+        status['stale'] = True  # No model → stale
+    return status
+
+def _current_season_by_date() -> int:
+    now = datetime.now()
+    return now.year if now.month >= 9 else now.year - 1
+
+def _train_models_for_scoring_in_background(scoring: str, seasons: list[int]):
+    def _run():
+        try:
+            app.logger.info(f"Training models for {scoring} using seasons: {seasons}")
+            gameday_predictor.predictor.train_models(seasons, scoring)
+            _save_current_model(scoring, seasons)
+            prediction_cache.clear()
+            app.logger.info(f"Models for {scoring} trained and saved")
+        except Exception as e:
+            app.logger.error(f"Training failed for {scoring}: {e}")
+    th = threading.Thread(target=_run)
+    th.daemon = True
+    th.start()
+    return th
+
+@app.route('/api/model-status')
+def model_status():
+    scoring = request.args.get('scoring')
+    if scoring:
+        return jsonify(_model_status_for_scoring(scoring))
+    systems = _all_scoring_systems()
+    statuses = [_model_status_for_scoring(s) for s in systems]
+    return jsonify({'models': statuses})
 
 @app.route('/api/health')
 def health():
@@ -434,11 +729,10 @@ def get_predictions(season, week, scoring_system):
             return jsonify(cached_data)
     
     try:
-        # Train models if needed (attempt to load saved models first)
+        # Train/load cutoff model for this selection if needed
         app.logger.info(f"Generating predictions for Week {week}, {season} - {scoring_system}")
 
-        if not getattr(gameday_predictor.predictor, 'models', None):
-            _try_load_models(scoring_system)
+        _ensure_cutoff_model_for_request(scoring_system, season, week)
         
         # Get gameday predictions
         gameday_data = gameday_predictor.get_gameday_predictions(
@@ -570,6 +864,14 @@ def update_data():
                     except Exception as dst_error:
                         app.logger.warning(f"DST stats update failed: {dst_error}")
                 
+                # Normalize synthetic game IDs to official IDs (post-collection)
+                try:
+                    app.logger.info("Normalizing game IDs to official schedule IDs...")
+                    summary = normalize_game_ids(db_manager, seasons=seasons, delete_stub_games=True)
+                    app.logger.info(f"Game ID normalization summary: {summary}")
+                except Exception as norm_err:
+                    app.logger.warning(f"Game ID normalization skipped/failed: {norm_err}")
+
                 # Update injury reports
                 if update_injuries:
                     app.logger.info("Updating injury reports...")
@@ -617,6 +919,11 @@ def update_data():
                 'injuries': update_injuries,
                 'dst_stats': update_dst,
                 'seasons': seasons
+            },
+            'model_status': {
+                'models': [_model_status_for_scoring(s) for s in _all_scoring_systems()],
+                'db_latest': {'season': (_db_latest_completed_tuple() or (None, None))[0],
+                              'week':   (_db_latest_completed_tuple() or (None, None))[1]}
             }
         })
     
@@ -637,14 +944,8 @@ def train_models():
                 app.logger.info(f"Training models for {scoring_system} using seasons: {seasons}")
                 gameday_predictor.predictor.train_models(seasons, scoring_system)
                 app.logger.info("Model training completed successfully")
-                # Persist trained models
-                try:
-                    _model_dir().mkdir(parents=True, exist_ok=True)
-                    model_path = _model_path_for_scoring(scoring_system)
-                    gameday_predictor.predictor.save_models(str(model_path))
-                    app.logger.info(f"Saved models for {scoring_system} to {model_path}")
-                except Exception as save_err:
-                    app.logger.warning(f"Could not save models for {scoring_system}: {save_err}")
+                # Persist trained models (versioned + CURRENT)
+                _save_current_model(scoring_system, seasons)
                 
                 # Clear prediction cache
                 prediction_cache.clear()
@@ -661,6 +962,32 @@ def train_models():
     
     except Exception as e:
         app.logger.error(f"Error starting model training: {e}")
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/train-stale-models', methods=['POST'])
+def train_stale_models():
+    """Train models for all scoring systems that are stale relative to DB latest data.
+
+    Uses GamedayPredictor's season selection to decide training window.
+    Runs in background and returns which trainings were started.
+    """
+    try:
+        systems = _all_scoring_systems()
+        db_latest = _db_latest_completed_tuple()
+        started = []
+        skipped = []
+        current_season = _current_season_by_date()
+        for scoring in systems:
+            status = _model_status_for_scoring(scoring)
+            if status.get('stale', True):
+                seasons = gameday_predictor._get_training_seasons(current_season)
+                _train_models_for_scoring_in_background(scoring, seasons)
+                started.append({'scoring': scoring, 'seasons': seasons})
+            else:
+                skipped.append({'scoring': scoring})
+        return jsonify({'status': 'started', 'started': started, 'skipped': skipped, 'db_latest': db_latest}), 202
+    except Exception as e:
+        app.logger.error(f"Error starting stale model training: {e}")
         return jsonify({'error': str(e)}), 500
 
 if __name__ == '__main__':

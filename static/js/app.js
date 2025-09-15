@@ -30,6 +30,7 @@ class NFLFantasyApp {
         document.getElementById('get-predictions')?.addEventListener('click', () => this.getPredictions());
         document.getElementById('refresh-injuries')?.addEventListener('click', () => this.showInjuryReport());
         document.getElementById('update-data')?.addEventListener('click', () => this.updateData());
+        document.getElementById('train-stale-models')?.addEventListener('click', () => this.trainStaleModels());
         document.getElementById('initialize-database')?.addEventListener('click', () => this.initializeDatabase());
         
         // Form inputs
@@ -438,7 +439,15 @@ class NFLFantasyApp {
                 if (inc.dst_stats) items.push('DST stats');
                 const seasons = (inc.seasons || []).join(', ');
                 const detail = items.length ? `Updating ${items.join(', ')}${seasons ? ` for seasons ${seasons}` : ''}...` : 'Data update started in background...';
-                this.showStatus(detail, 'success');
+                // Append model freshness info if provided
+                let statusMsg = detail;
+                if (data.model_status && data.model_status.models) {
+                    const stale = data.model_status.models.filter(m => m.stale).map(m => m.scoring);
+                    if (stale.length) {
+                        statusMsg += ` | Stale models: ${stale.join(', ')} (training recommended)`;
+                    }
+                }
+                this.showStatus(statusMsg, 'success');
                 setTimeout(() => this.hideStatus(), 3000);
             } else {
                 throw new Error(data.error || 'Failed to update data');
@@ -446,6 +455,33 @@ class NFLFantasyApp {
         } catch (error) {
             console.error('Failed to update data:', error);
             this.showError('Failed to update data: ' + error.message);
+        }
+    }
+
+    async trainStaleModels() {
+        this.showStatus('Checking models and starting training if needed...', 'loading');
+        try {
+            const resp = await fetch('/api/train-stale-models', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({})
+            });
+            const data = await resp.json();
+            if (resp.ok) {
+                const started = (data.started || []).map(s => s.scoring);
+                const skipped = (data.skipped || []).map(s => s.scoring);
+                let msg = '';
+                if (started.length) msg += `Training started for: ${started.join(', ')}`;
+                if (skipped.length) msg += `${msg ? ' | ' : ''}Up-to-date: ${skipped.join(', ')}`;
+                if (!msg) msg = 'No scoring systems found.';
+                this.showStatus(msg, 'success');
+                setTimeout(() => this.hideStatus(), 3000);
+            } else {
+                throw new Error(data.error || 'Failed to start training');
+            }
+        } catch (err) {
+            console.error('trainStaleModels error:', err);
+            this.showError('Training failed: ' + err.message);
         }
     }
 
