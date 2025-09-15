@@ -1124,3 +1124,29 @@ body {
         display: none;
     }
 }
+
+/* Model status badge coloring */
+#model-status-badge.ok { color: var(--success); }
+#model-status-badge.warn { color: var(--accent); }
+
+/* Optimized Team Progress */
+.progress-section {
+    background: var(--bg-card);
+    border: 1px solid var(--border-color);
+    border-radius: var(--border-radius);
+    padding: var(--spacing-4);
+    box-shadow: var(--shadow);
+    margin-top: var(--spacing-4);
+}
+.progress-grid {
+    display: grid;
+    grid-template-columns: 1fr 80px 80px 90px;
+    gap: var(--spacing-3);
+}
+.progress-header { display: contents; color: var(--text-muted); font-weight: 500; }
+.progress-item { display: contents; }
+.progress-player .name { font-weight: 600; }
+.progress-player .meta { color: var(--text-muted); font-size: var(--font-size-sm); }
+.progress-predicted, .progress-actual, .progress-status { align-self: center; }
+.progress-item.completed .progress-status { color: var(--success); }
+.progress-item.pending .progress-status { color: var(--warning); }

@@ -24,6 +24,7 @@ from pathlib import Path
 import json
 import platform
 import warnings
+import pandas as pd
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -233,6 +234,7 @@ def _save_current_model(scoring_system: str, seasons: list[int]):
         pred = gameday_predictor.predictor
         meta['features'] = {
             'feature_columns': getattr(pred, 'feature_columns', []),
+            'feature_columns_map': getattr(pred, 'feature_columns_map', {}),
             'dst_feature_columns': getattr(pred, 'dst_feature_columns', []),
             'supports_position_features': getattr(pred, 'supports_position_features', False)
         }
@@ -523,12 +525,7 @@ def get_current_week():
 
 @app.route('/api/schedule/<int:season>/<int:week>')
 def get_schedule(season, week):
-    """Get NFL schedule for specific week."""
-    cache_key = f"{season}_{week}"
-    
-    if cache_key in schedule_cache:
-        return jsonify(schedule_cache[cache_key])
-    
+    """Get NFL schedule for specific week (no stale caching for current needs)."""
     try:
         with db_manager.engine.connect() as conn:
             games = conn.execute(text("""
@@ -578,11 +575,233 @@ def get_schedule(season, week):
                     'completed': game[7] is not None and game[8] is not None
                 })
             
-            schedule_cache[cache_key] = schedule_data
             return jsonify(schedule_data)
     
     except Exception as e:
         app.logger.error(f"Error getting schedule: {e}")
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/optimized-progress/<int:season>/<int:week>/<scoring_system>')
+def optimized_progress(season: int, week: int, scoring_system: str):
+    """Compute actual-to-date points for the current optimized lineup for the given week.
+
+    Actual points are summed only for games that have completed (both scores present).
+    """
+    try:
+        # Use the same pipeline as predictions to build optimal lineup
+        gameday = gameday_predictor.get_gameday_predictions(week, season, scoring_system, include_injury_adjustments=True)
+        optimal = gameday.get('optimal_lineups', {}).get('optimal', {})
+        players_by_pos = optimal.get('players', {})
+        total_pred = float(optimal.get('total_projected', 0.0))
+
+        # Flatten selected players
+        selected = []
+        for pos in ['QB', 'RB', 'WR', 'TE']:
+            for p in players_by_pos.get(pos, []):
+                selected.append(p)
+
+        if not selected:
+            return jsonify({
+                'season': season,
+                'week': week,
+                'scoring_system': scoring_system,
+                'optimized_total_predicted': 0.0,
+                'optimized_total_actual': 0.0,
+                'players': []
+            })
+
+        player_ids = [p.get('player_id') for p in selected if p.get('player_id')]
+
+        actual_by_player = {}
+        completed_flags = {}
+
+        # Primary method: compute from play-by-play for the week (live or final)
+        try:
+            import nfl_data_py as nfl
+            pbp = nfl.import_pbp_data([season])
+            pbp = pbp[pbp['week'] == week]
+            if not pbp.empty:
+                # Pre-select plays that involve any of the selected players to trim work
+                pset = set(player_ids)
+                sub = pbp[(pbp['passer_player_id'].isin(pset)) |
+                          (pbp['rusher_player_id'].isin(pset)) |
+                          (pbp['receiver_player_id'].isin(pset))]
+                for pid in player_ids:
+                    if pid is None:
+                        continue
+                    # Passing
+                    pass_plays = sub[sub['passer_player_id'] == pid]
+                    pass_att = int((pass_plays['pass_attempt'] if 'pass_attempt' in pass_plays else pass_plays['pass'].fillna(0)).sum()) if not pass_plays.empty else 0
+                    comps = int(pass_plays['complete_pass'].fillna(0).sum()) if not pass_plays.empty and 'complete_pass' in pass_plays else 0
+                    pass_yards = int(pass_plays['passing_yards'].fillna(0).sum()) if not pass_plays.empty and 'passing_yards' in pass_plays else 0
+                    pass_tds = int(pass_plays['pass_touchdown'].fillna(0).sum()) if not pass_plays.empty and 'pass_touchdown' in pass_plays else 0
+                    interceptions = int(pass_plays['interception'].fillna(0).sum()) if not pass_plays.empty and 'interception' in pass_plays else 0
+                    # Rushing
+                    rush_plays = sub[sub['rusher_player_id'] == pid]
+                    rush_att = int(rush_plays['rush_attempt'].fillna(0).sum()) if not rush_plays.empty and 'rush_attempt' in rush_plays else 0
+                    rush_yards = int(rush_plays['rushing_yards'].fillna(0).sum()) if not rush_plays.empty and 'rushing_yards' in rush_plays else 0
+                    rush_tds = int(rush_plays['rush_touchdown'].fillna(0).sum()) if not rush_plays.empty and 'rush_touchdown' in rush_plays else 0
+                    # Receiving
+                    rec_plays = sub[sub['receiver_player_id'] == pid]
+                    receptions = int(rec_plays['complete_pass'].fillna(0).sum()) if not rec_plays.empty and 'complete_pass' in rec_plays else 0
+                    rec_yards = int(rec_plays['receiving_yards'].fillna(0).sum()) if not rec_plays.empty and 'receiving_yards' in rec_plays else 0
+                    rec_tds = int(rec_plays['pass_touchdown'].fillna(0).sum()) if not rec_plays.empty and 'pass_touchdown' in rec_plays else 0
+
+                    if any([pass_att, rush_att, receptions, pass_yards, rush_yards, rec_yards, pass_tds, rush_tds, rec_tds, interceptions]):
+                        row = {
+                            'pass_attempts': pass_att, 'pass_completions': comps, 'pass_yards': pass_yards,
+                            'pass_touchdowns': pass_tds, 'pass_interceptions': interceptions,
+                            'rush_attempts': rush_att, 'rush_yards': rush_yards, 'rush_touchdowns': rush_tds,
+                            'receptions': receptions, 'receiving_yards': rec_yards, 'receiving_touchdowns': rec_tds
+                        }
+                        pts = gameday_predictor.calculator.calculate_player_points(row, scoring_system)
+                        actual_by_player[pid] = float(pts.total_points)
+        except Exception as pbp_err:
+            app.logger.warning(f"PBP live aggregation failed; falling back to completed games: {pbp_err}")
+
+        # Fallback: completed games from DB (if any remain missing)
+        missing_ids = [pid for pid in player_ids if pid not in actual_by_player]
+        if missing_ids:
+            with db_manager.engine.connect() as conn:
+                ph = ','.join([f":p{i}" for i in range(len(missing_ids))])
+                params = {f"p{i}": pid for i, pid in enumerate(missing_ids)}
+                params.update({'season': season, 'week': week})
+                rows = conn.execute(text(f"""
+                    SELECT gs.*, g.season_id, g.week, g.home_score, g.away_score
+                    FROM game_stats gs
+                    JOIN games g ON gs.game_id = g.game_id
+                    WHERE g.season_id = :season AND g.week = :week
+                      AND gs.player_id IN ({ph})
+                      AND g.home_score IS NOT NULL AND g.away_score IS NOT NULL
+                """), params).fetchall()
+            for r in rows:
+                row = dict(r._mapping) if hasattr(r, '_mapping') else dict(r)
+                pts = gameday_predictor.calculator.calculate_player_points(row, scoring_system)
+                pid = row.get('player_id')
+                actual_by_player[pid] = float(pts.total_points)
+                completed_flags[pid] = True
+
+        # Determine completion status for all selected players using games table
+        if player_ids:
+            with db_manager.engine.connect() as conn:
+                ph = ','.join([f":c{i}" for i in range(len(player_ids))])
+                params = {f"c{i}": pid for i, pid in enumerate(player_ids)}
+                params.update({'season': season, 'week': week})
+                comp_rows = conn.execute(text(f"""
+                    SELECT DISTINCT gs.player_id, g.home_score, g.away_score
+                    FROM game_stats gs
+                    JOIN games g ON gs.game_id = g.game_id
+                    WHERE g.season_id = :season AND g.week = :week
+                      AND gs.player_id IN ({ph})
+                """), params).fetchall()
+            for r in comp_rows:
+                pid = r[0]
+                hs, as_ = r[1], r[2]
+                if hs is not None and as_ is not None:
+                    completed_flags[pid] = True
+
+        # Determine completion via team/week for players without stats and finalize zero-actuals
+        with db_manager.engine.connect() as conn:
+            for p in selected:
+                pid = p.get('player_id')
+                team_id = p.get('team_id')
+                if pid not in completed_flags and team_id:
+                    row = conn.execute(text("""
+                        SELECT home_score, away_score
+                        FROM games
+                        WHERE season_id = :season AND week = :week
+                          AND (home_team_id = :team OR away_team_id = :team)
+                        LIMIT 1
+                    """), {'season': season, 'week': week, 'team': team_id}).fetchone()
+                    if row is not None and row[0] is not None and row[1] is not None:
+                        completed_flags[pid] = True
+                        # If game is final and player had no recorded stats, set actual to 0
+                        if pid not in actual_by_player:
+                            actual_by_player[pid] = 0.0
+
+        # Assemble breakdown
+        total_actual = 0.0
+        out_players = []
+        for p in selected:
+            pid = p.get('player_id')
+            actual = actual_by_player.get(pid)
+            if actual is not None:
+                total_actual += actual
+            out_players.append({
+                'player_id': pid,
+                'player_name': p.get('player_name'),
+                'position': p.get('position'),
+                'team_id': p.get('team_id'),
+                'predicted_points': float(p.get('predicted_points', 0.0)),
+                'actual_points': actual,
+                'status': 'completed' if completed_flags.get(pid) else 'pending'
+            })
+
+        return jsonify({
+            'season': season,
+            'week': week,
+            'scoring_system': scoring_system,
+            'timestamp': datetime.now().isoformat(),
+            'optimized_total_predicted': total_pred,
+            'optimized_total_actual': round(total_actual, 2),
+            'players': out_players
+        })
+    except Exception as e:
+        app.logger.error(f"Optimized progress error: {e}")
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/refresh-scores', methods=['POST'])
+def refresh_scores():
+    """Refresh scores/times for a given season/week from nfl_data_py schedules.
+
+    Body JSON: {"season": 2025, "week": 2}
+    Returns: {updated: N}
+    """
+    try:
+        payload = request.get_json(silent=True) or {}
+        season = int(payload.get('season'))
+        week = int(payload.get('week')) if payload.get('week') else None
+        import nfl_data_py as nfl
+        schedules = nfl.import_schedules([season])
+        schedules = schedules[schedules['game_type'] == 'REG']
+        if week is not None:
+            schedules = schedules[schedules['week'] == week]
+        updated = 0
+        with db_manager.engine.connect() as conn:
+            for _, game in schedules.iterrows():
+                try:
+                    res = conn.execute(text("""
+                        UPDATE games
+                        SET game_date = :gameday,
+                            game_time = :gametime,
+                            home_team_id = :home,
+                            away_team_id = :away,
+                            home_score = :hs,
+                            away_score = :as
+                        WHERE game_id = :gid
+                    """), {
+                        'gameday': game.get('gameday'),
+                        'gametime': game.get('gametime'),
+                        'home': game['home_team'],
+                        'away': game['away_team'],
+                        'hs': None if pd.isna(game.get('home_score')) else int(game.get('home_score')),
+                        'as': None if pd.isna(game.get('away_score')) else int(game.get('away_score')),
+                        'gid': game['game_id']
+                    })
+                    if getattr(res, 'rowcount', 0) > 0:
+                        updated += res.rowcount
+                except Exception:
+                    # Skip malformed rows
+                    continue
+            try:
+                conn.commit()
+            except Exception:
+                pass
+        # Bust any in-memory schedule cache
+        schedule_cache.clear()
+        return jsonify({'season': season, 'week': week, 'updated': int(updated)})
+    except Exception as e:
+        app.logger.error(f"refresh_scores error: {e}")
         return jsonify({'error': str(e)}), 500
 
 @app.route('/api/injury-report')
@@ -819,19 +1038,46 @@ def update_data():
                     for season in seasons:
                         try:
                             if season >= 2025:
-                                # Use current season method for 2025+
-                                app.logger.info(f"Updating current season {season} data...")
-                                # Check if we already have data for this season
+                                # Always refresh current season schedules/scores idempotently
+                                app.logger.info(f"Refreshing current season {season} schedules and scores...")
+                                try:
+                                    import nfl_data_py as nfl
+                                    schedules = nfl.import_schedules([season])
+                                    schedules = schedules[schedules['game_type'] == 'REG']
+                                    with db_manager.engine.connect() as conn:
+                                        for _, game in schedules.iterrows():
+                                            try:
+                                                conn.execute(text("""
+                                                    UPDATE games
+                                                    SET game_date = :gameday,
+                                                        game_time = :gametime,
+                                                        home_team_id = :home,
+                                                        away_team_id = :away,
+                                                        home_score = :hs,
+                                                        away_score = :as
+                                                    WHERE game_id = :gid
+                                                """), {
+                                                    'gameday': game.get('gameday'),
+                                                    'gametime': game.get('gametime'),
+                                                    'home': game['home_team'],
+                                                    'away': game['away_team'],
+                                                    'hs': None if pd.isna(game.get('home_score')) else int(game.get('home_score')),
+                                                    'as': None if pd.isna(game.get('away_score')) else int(game.get('away_score')),
+                                                    'gid': game['game_id']
+                                                })
+                                            except Exception as ue:
+                                                app.logger.debug(f"Schedule update skip: {ue}")
+                                        try:
+                                            conn.commit()
+                                        except Exception:
+                                            pass
+                                except Exception as refresh_err:
+                                    app.logger.warning(f"Current season schedule refresh failed: {refresh_err}")
+                                # Ensure minimal coverage exists
                                 with db_manager.engine.connect() as conn:
-                                    result = conn.execute(text("SELECT COUNT(*) FROM games WHERE season_id = :season"), 
-                                                        {"season": season}).fetchone()
+                                    result = conn.execute(text("SELECT COUNT(*) FROM games WHERE season_id = :season"), {"season": season}).fetchone()
                                     game_count = result[0] if result else 0
-                                
-                                if game_count > 0:
-                                    app.logger.info(f"Current season {season} already has {game_count} games")
-                                    app.logger.info(f"Skipping game collection to avoid duplicates")
-                                    # Could add logic here to update only new/changed games if needed
-                                else:
+                                if game_count == 0:
                                     app.logger.info(f"No existing data for current season {season}, collecting all data...")
                                     data_collector._collect_current_season_data(season)
                             else:

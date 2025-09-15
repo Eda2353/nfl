@@ -28,6 +28,10 @@
                             <span class="stat-value" id="injury-count">-</span>
                             <span class="stat-label">Injuries</span>
                         </div>
+                        <div class="stat">
+                            <span class="stat-value" id="model-status-badge">—</span>
+                            <span class="stat-label">Models</span>
+                        </div>
                     </div>
                 </div>
             </div>
@@ -106,6 +110,9 @@
                         <h2><i class="fas fa-calendar-alt"></i> NFL Schedule</h2>
                         <div class="section-meta">
                             <span id="schedule-week">Week 2, 2025</span>
+                            <button id="refresh-scores" class="btn btn-secondary" style="margin-left: 12px;">
+                                <i class="fas fa-rotate"></i> Refresh Scores
+                            </button>
                         </div>
                     </div>
                     <div class="games-grid" id="games-grid">
@@ -168,6 +175,19 @@
                         </div>
                         <div class="lineup-grid" id="optimal-lineup">
                             <!-- Optimal lineup will be populated here -->
+                        </div>
+                    </section>
+
+                    <!-- Optimized Team Progress -->
+                    <section class="progress-section">
+                        <div class="section-header">
+                            <h2><i class="fas fa-hourglass-half"></i> Optimized Team Progress</h2>
+                            <div class="lineup-total">
+                                Actual So Far: <span id="progress-total">0.0</span> pts
+                            </div>
+                        </div>
+                        <div class="progress-grid" id="optimized-progress">
+                            <!-- Progress breakdown will be populated here -->
                         </div>
                     </section>
 

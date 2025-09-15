@@ -30,6 +30,7 @@ class NFLFantasyApp {
         document.getElementById('get-predictions')?.addEventListener('click', () => this.getPredictions());
         document.getElementById('refresh-injuries')?.addEventListener('click', () => this.showInjuryReport());
         document.getElementById('update-data')?.addEventListener('click', () => this.updateData());
+        document.getElementById('refresh-scores')?.addEventListener('click', () => this.refreshScores());
         document.getElementById('train-stale-models')?.addEventListener('click', () => this.trainStaleModels());
         document.getElementById('initialize-database')?.addEventListener('click', () => this.initializeDatabase());
         
@@ -73,11 +74,40 @@ class NFLFantasyApp {
         // Load current week info
         await this.loadCurrentWeek();
         
+        // Load model status (staleness)
+        await this.loadModelStatus();
+
         // Load initial schedule
         await this.loadSchedule();
         
         // Update last updated time
         this.updateLastUpdated();
+    }
+
+    async loadModelStatus() {
+        try {
+            const resp = await fetch('/api/model-status');
+            const data = await resp.json();
+            const badge = document.getElementById('model-status-badge');
+            if (!badge) return;
+            let staleCount = 0;
+            if (data && Array.isArray(data.models)) {
+                staleCount = data.models.filter(m => m.stale).length;
+            } else if (data && data.stale !== undefined) {
+                staleCount = data.stale ? 1 : 0;
+            }
+            if (staleCount > 0) {
+                badge.textContent = `Stale (${staleCount})`;
+                badge.classList.remove('ok');
+                badge.classList.add('warn');
+            } else {
+                badge.textContent = 'Up‑to‑date';
+                badge.classList.remove('warn');
+                badge.classList.add('ok');
+            }
+        } catch (e) {
+            // Non-fatal
+        }
     }
 
     async loadScoringSystems() {
@@ -163,10 +193,32 @@ class NFLFantasyApp {
         }
     }
 
+    async refreshScores() {
+        this.showStatus('Refreshing scores...', 'loading');
+        try {
+            const resp = await fetch('/api/refresh-scores', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ season: this.currentSeason, week: this.currentWeek })
+            });
+            const data = await resp.json();
+            if (!resp.ok) throw new Error(data.error || 'Failed to refresh scores');
+            this.showStatus(`Scores refreshed: ${data.updated || 0} games updated`, 'success');
+            setTimeout(() => this.hideStatus(), 2000);
+            // Reload schedule and progress
+            await this.loadSchedule();
+            await this.loadOptimizedProgress();
+        } catch (e) {
+            console.error('refreshScores error', e);
+            this.showError('Failed to refresh scores');
+        }
+    }
+
     createGameCard(game) {
         const gameDate = game.date ? new Date(game.date).toLocaleDateString() : 'TBD';
         const gameTime = game.time || 'TBD';
-        const completed = game.completed;
+        const completed = !!game.completed;
+        const status = completed ? 'Final' : gameTime;
         const scoreDisplay = completed ? 
             `<div class="game-score">
                 <span>${game.home_team}: ${game.home_score}</span>
@@ -176,7 +228,7 @@ class NFLFantasyApp {
         return `
             <div class="game-card ${completed ? 'game-completed' : ''}">
                 <div class="game-header">
-                    <div class="game-time">${gameDate} ${gameTime}</div>
+                    <div class="game-time">${gameDate} ${status}</div>
                 </div>
                 <div class="game-matchup">
                     <span class="team">${game.away_team}</span>
@@ -215,6 +267,9 @@ class NFLFantasyApp {
         // Update optimal lineup
         this.updateOptimalLineup(data);
         
+        // Load optimized team progress (actual points so far)
+        this.loadOptimizedProgress();
+
         // Update player rankings
         this.updatePlayerRankings(data);
         
@@ -226,6 +281,47 @@ class NFLFantasyApp {
             document.getElementById('injury-count').textContent = 
                 data.injury_report.total_out + data.injury_report.total_questionable;
         }
+    }
+
+    async loadOptimizedProgress() {
+        try {
+            const resp = await fetch(`/api/optimized-progress/${this.currentSeason}/${this.currentWeek}/${this.currentScoring}`);
+            const data = await resp.json();
+            if (resp.ok) {
+                this.updateOptimizedProgress(data);
+            }
+        } catch (e) {
+            // Non-fatal
+        }
+    }
+
+    updateOptimizedProgress(data) {
+        const total = document.getElementById('progress-total');
+        const grid = document.getElementById('optimized-progress');
+        if (!grid || !total) return;
+        total.textContent = (data.optimized_total_actual || 0).toFixed(1);
+
+        const rows = (data.players || []).map(p => `
+            <div class="progress-item ${p.status}">
+                <div class="progress-player">
+                    <div class="name">${p.player_name}</div>
+                    <div class="meta">${p.team_id} • ${p.position}</div>
+                </div>
+                <div class="progress-predicted">${(p.predicted_points || 0).toFixed(1)}</div>
+                <div class="progress-actual">${p.actual_points != null ? p.actual_points.toFixed(1) : '—'}</div>
+                <div class="progress-status">${p.status === 'completed' ? 'Final' : 'Pending'}</div>
+            </div>
+        `).join('');
+
+        grid.innerHTML = `
+            <div class="progress-header">
+                <div>Player</div>
+                <div>Pred</div>
+                <div>Actual</div>
+                <div>Status</div>
+            </div>
+            ${rows || '<div class="no-data">No lineup available</div>'}
+        `;
     }
 
     updateSummaryCards(data) {
@@ -449,6 +545,8 @@ class NFLFantasyApp {
                 }
                 this.showStatus(statusMsg, 'success');
                 setTimeout(() => this.hideStatus(), 3000);
+                // Refresh header badge
+                this.loadModelStatus();
             } else {
                 throw new Error(data.error || 'Failed to update data');
             }
@@ -476,6 +574,10 @@ class NFLFantasyApp {
                 if (!msg) msg = 'No scoring systems found.';
                 this.showStatus(msg, 'success');
                 setTimeout(() => this.hideStatus(), 3000);
+                // Poll model status a few times as background training completes
+                setTimeout(() => this.loadModelStatus(), 2000);
+                setTimeout(() => this.loadModelStatus(), 8000);
+                setTimeout(() => this.loadModelStatus(), 15000);
             } else {
                 throw new Error(data.error || 'Failed to start training');
             }

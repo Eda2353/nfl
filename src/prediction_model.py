@@ -105,7 +105,8 @@ class PlayerPredictor:
         self.position_matchup_analyzer = PositionMatchupAnalyzer(db_manager, calculator)
         self.models = {}  # One model per position
         self.scalers = {}  # One scaler per position
-        self.feature_columns = []
+        self.feature_columns = []  # base features (back-compat)
+        self.feature_columns_map = {}  # per-position columns including position-specific features
         self._feature_cache = {}
         
     def extract_features(self, player_id: str, target_week: int, target_season: int, 
@@ -414,13 +415,16 @@ class PlayerPredictor:
         # Prepare training data
         position_data = self.prepare_training_data(seasons, scoring_system, cutoff=cutoff)
 
-        
-        
-        self.feature_columns = [
-            'avg_fantasy_points_l3', 'avg_targets_l3', 'avg_carries_l3', 
+        # Base feature set
+        base_columns = [
+            'avg_fantasy_points_l3', 'avg_targets_l3', 'avg_carries_l3',
             'avg_passing_attempts_l3', 'avg_fantasy_points_season', 'games_played_season',
             'position_encoded', 'target_share_l3', 'consistency_score', 'trend_score'
         ]
+        # Keep base list for backward compatibility in saved metadata
+        self.feature_columns = list(base_columns)
+        # Enable position-specific features for training
+        self.supports_position_features = True
         
         for position in ['QB', 'RB', 'WR', 'TE']:
             data = position_data[position]
@@ -429,9 +433,12 @@ class PlayerPredictor:
                 print(f"Insufficient data for {position}: {len(data)} examples")
                 continue
             
-            # Prepare features - use base features only for historical compatibility
-            # Position-specific features will be added for future enhanced training
-            X = data[self.feature_columns].fillna(0)
+            # Compose full column order: base + position-specific
+            pos_cols = self._get_position_feature_order(position)
+            full_cols = base_columns + [c for c in pos_cols if c in data.columns]
+            self.feature_columns_map[position] = list(full_cols)
+
+            X = data[full_cols].fillna(0)
             y = data['target']
             
             # Split data
@@ -476,8 +483,6 @@ class PlayerPredictor:
             self.models[position] = best_model
             print(f"Best model for {position}: MAE={best_score:.2f}")
         
-        # Mark that current models only support base features (historical compatibility)
-        self.supports_position_features = False
         
         # Train DST model
         print("\n" + "="*50)
@@ -533,17 +538,44 @@ class PlayerPredictor:
                 x = np.arange(len(recent_5))
                 y = recent_5['fantasy_points'].values
                 trend = np.polyfit(x, y, 1)[0]
-            base_features = [
-                avg_fp_l3, avg_targets_l3, avg_carries_l3, avg_pass_att_l3,
-                avg_fp_season, games_played_season, pos_enc, target_share_l3,
-                consistency, trend
-            ]
-            feature_names = [
-                'avg_fantasy_points_l3', 'avg_targets_l3', 'avg_carries_l3', 
-                'avg_passing_attempts_l3', 'avg_fantasy_points_season', 'games_played_season',
-                'position_encoded', 'target_share_l3', 'consistency_score', 'trend_score'
-            ]
-            X = pd.DataFrame([base_features], columns=feature_names)
+            # Assemble feature row
+            feature_row = {
+                'avg_fantasy_points_l3': avg_fp_l3,
+                'avg_targets_l3': avg_targets_l3,
+                'avg_carries_l3': avg_carries_l3,
+                'avg_passing_attempts_l3': avg_pass_att_l3,
+                'avg_fantasy_points_season': avg_fp_season,
+                'games_played_season': games_played_season,
+                'position_encoded': pos_enc,
+                'target_share_l3': target_share_l3,
+                'consistency_score': consistency,
+                'trend_score': trend,
+            }
+
+            # Add position features if supported
+            if hasattr(self, 'supports_position_features') and self.supports_position_features and position in ['QB','RB','WR','TE']:
+                # Determine team and opponent for target week
+                with self.db.engine.connect() as conn:
+                    from sqlalchemy import text
+                    team_df = pd.read_sql_query(text("""
+                        SELECT DISTINCT gs.team_id
+                        FROM game_stats gs
+                        JOIN games g ON gs.game_id = g.game_id
+                        WHERE gs.player_id = :player_id 
+                          AND g.season_id = :season 
+                          AND g.week < :week
+                        ORDER BY g.week DESC
+                        LIMIT 1
+                    """), conn, params={'player_id': player_id, 'season': season, 'week': week})
+                if not team_df.empty:
+                    player_team = team_df.iloc[0]['team_id']
+                    opponent_team = self.matchup_analyzer.get_opponent_for_team(player_team, season, week)
+                    if opponent_team:
+                        pos_feats = self.position_matchup_analyzer.get_position_matchup_features(position, player_team, opponent_team, season, week) or {}
+                        feature_row.update(pos_feats)
+
+            cols = self.feature_columns_map.get(position, self.feature_columns)
+            X = pd.DataFrame([[feature_row.get(c, 0.0) for c in cols]], columns=cols)
             if isinstance(self.models[position], Ridge):
                 X = self.scalers[position].transform(X)
             else:
@@ -556,42 +588,25 @@ class PlayerPredictor:
         if features is None:
             return None
         
-        # Prepare base feature vector
-        base_features = [
-            features.avg_fantasy_points_l3,
-            features.avg_targets_l3,
-            features.avg_carries_l3,
-            features.avg_passing_attempts_l3,
-            features.avg_fantasy_points_season,
-            features.games_played_season,
-            features.position_encoded,
-            features.target_share_l3,
-            features.consistency_score,
-            features.trend_score
-        ]
-        
-        # Add position-specific matchup features if available and models support them
-        # For backward compatibility with models trained on historical data
-        if hasattr(self, 'supports_position_features') and self.supports_position_features:
-            position_specific_order = self._get_position_feature_order(position)
-            for feature_name in position_specific_order:
-                value = features.position_matchup_features.get(feature_name, 0.0) if features.position_matchup_features else 0.0
-                base_features.append(value)
-        
-        feature_vector = base_features
-        
-        # Create feature array - use pandas DataFrame to preserve feature names for scaler
-        feature_names = [
-            'avg_fantasy_points_l3', 'avg_targets_l3', 'avg_carries_l3', 
-            'avg_passing_attempts_l3', 'avg_fantasy_points_season', 'games_played_season',
-            'position_encoded', 'target_share_l3', 'consistency_score', 'trend_score'
-        ]
-        
-        if hasattr(self, 'supports_position_features') and self.supports_position_features:
-            position_specific_order = self._get_position_feature_order(position)
-            feature_names.extend(position_specific_order)
-        
-        X = pd.DataFrame([feature_vector], columns=feature_names[:len(feature_vector)])
+        # Build feature row aligned to training columns
+        feature_row = {
+            'avg_fantasy_points_l3': features.avg_fantasy_points_l3,
+            'avg_targets_l3': features.avg_targets_l3,
+            'avg_carries_l3': features.avg_carries_l3,
+            'avg_passing_attempts_l3': features.avg_passing_attempts_l3,
+            'avg_fantasy_points_season': features.avg_fantasy_points_season,
+            'games_played_season': features.games_played_season,
+            'position_encoded': features.position_encoded,
+            'target_share_l3': features.target_share_l3,
+            'consistency_score': features.consistency_score,
+            'trend_score': features.trend_score,
+        }
+        if hasattr(self, 'supports_position_features') and self.supports_position_features and position in ['QB','RB','WR','TE']:
+            for fname in self._get_position_feature_order(position):
+                feature_row[fname] = (features.position_matchup_features or {}).get(fname, 0.0)
+
+        cols = self.feature_columns_map.get(position, self.feature_columns)
+        X = pd.DataFrame([[feature_row.get(c, 0.0) for c in cols]], columns=cols)
         
         # Scale if using Ridge regression
         if isinstance(self.models[position], Ridge):
@@ -610,7 +625,9 @@ class PlayerPredictor:
         model_data = {
             'models': self.models,
             'scalers': self.scalers,
-            'feature_columns': self.feature_columns
+            'feature_columns': self.feature_columns,
+            'feature_columns_map': self.feature_columns_map,
+            'supports_position_features': getattr(self, 'supports_position_features', False)
         }
         
         # Add DST feature columns if available
@@ -629,11 +646,21 @@ class PlayerPredictor:
         
         self.models = model_data['models']
         self.scalers = model_data['scalers']
-        self.feature_columns = model_data['feature_columns']
+        self.feature_columns = model_data.get('feature_columns', [])
+        # Per-position feature map (new)
+        self.feature_columns_map = model_data.get('feature_columns_map', {
+            'QB': list(self.feature_columns),
+            'RB': list(self.feature_columns),
+            'WR': list(self.feature_columns),
+            'TE': list(self.feature_columns),
+        })
         
         # Load DST feature columns if available
         if 'dst_feature_columns' in model_data:
             self.dst_feature_columns = model_data['dst_feature_columns']
+        
+        # Feature support flag (default False for legacy models)
+        self.supports_position_features = bool(model_data.get('supports_position_features', False))
         
         print(f"Models loaded from {filepath}")
         print(f"Loaded models: {list(self.models.keys())}")
